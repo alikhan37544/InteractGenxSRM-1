@@ -108,7 +108,7 @@ function App() {
                             </motion.div>
                             <div>
                                 <h1 className="text-2xl font-bold text-gradient">Ghost Pilot</h1>
-                                <p className="text-sm text-ghost-border font-mono">Autonomous Browser Agent</p>
+                                <p className="text-sm text-gray-400 font-mono">Autonomous Browser Agent</p>
                             </div>
                         </div>
 
@@ -147,7 +147,7 @@ function App() {
                                     animate={{ opacity: 1, y: 0 }}
                                     exit={{ opacity: 0, y: -20 }}
                                 >
-                                    <p className="text-sm text-ghost-border mb-1 font-mono">MISSION OBJECTIVE:</p>
+                                    <p className="text-sm text-gray-300 mb-1 font-mono">MISSION OBJECTIVE:</p>
                                     <p className="text-lg font-semibold text-ghost-primary">"{currentObjective}"</p>
                                 </motion.div>
                             )}
@@ -207,7 +207,7 @@ function App() {
                             <h3 className="text-sm font-bold text-ghost-primary mb-3 uppercase tracking-wide">
                                 How It Works
                             </h3>
-                            <div className="space-y-3 text-sm text-ghost-border">
+                            <div className="space-y-3 text-sm text-gray-300">
                                 <div className="flex gap-3">
                                     <span className="text-xl">🎤</span>
                                     <p>Speak or type your command</p>
@@ -227,7 +227,7 @@ function App() {
                             </div>
 
                             <div className="mt-6 pt-4 border-t border-ghost-border/30">
-                                <p className="text-xs text-ghost-border/60 font-mono">
+                                <p className="text-xs text-gray-500 font-mono">
                                     Powered by GPT-4o • Playwright • React
                                 </p>
                             </div>

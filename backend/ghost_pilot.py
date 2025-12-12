@@ -10,6 +10,10 @@ from typing import Optional, Dict, Any
 from playwright.async_api import async_playwright, Page, Browser
 from openai import OpenAI
 import asyncio
+import re
+from datetime import datetime, timedelta
+from collections import deque
+import os
 
 class GhostPilot:
     def __init__(self, provider: str, **kwargs):
@@ -41,6 +45,29 @@ class GhostPilot:
             self.model_name = kwargs.get("model", "gpt-4o")
             print(f"🤖 Using OpenAI API")
             
+        elif self.provider == "gemini":
+            # Google Gemini API - BEST FREE TIER!
+            try:
+                import google.generativeai as genai
+                self.genai = genai
+                genai.configure(api_key=kwargs.get("api_key"))
+                self.model_name = kwargs.get("model", "gemini-2.0-flash-exp")
+                self.gemini_model = genai.GenerativeModel(self.model_name)
+                print(f"🤖 Using Google Gemini: {self.model_name}")
+                self.openai_client = None  # Gemini uses different client
+            except ImportError:
+                raise ImportError("Please install google-generativeai: pip install google-generativeai")
+            
+        elif self.provider == "openrouter":
+            # OpenRouter - access to multiple providers with free tier
+            self.openai_client = OpenAI(
+                api_key=kwargs.get("api_key"),
+                base_url="https://openrouter.ai/api/v1"
+            )
+            # Use working free vision models
+            self.model_name = kwargs.get("model", "meta-llama/llama-3.2-11b-vision-instruct:free")
+            print(f"🤖 Using OpenRouter with model: {self.model_name}")
+            
         elif self.provider == "custom":
             # Custom endpoint (like your current setup)
             self.openai_client = OpenAI(
@@ -51,13 +78,20 @@ class GhostPilot:
             print(f"🤖 Using custom endpoint: {kwargs.get('base_url')}")
             
         else:
-            raise ValueError(f"Unknown provider: {provider}. Use 'lmstudio', 'openai', or 'custom'")
+            raise ValueError(f"Unknown provider: {provider}. Use 'lmstudio', 'openai', 'gemini', 'openrouter', or 'custom'")
         
         self.playwright = None
         self.browser: Optional[Browser] = None
         self.page: Optional[Page] = None
         self.element_map: Dict[int, Any] = {}
         self.action_history: list = []  # Track recent actions to prevent loops
+        
+        # Rate limiting infrastructure
+        self.request_timestamps = deque(maxlen=20)  # Track last 20 requests for RPM limiting
+        self.daily_request_count = 0
+        self.daily_reset_time = datetime.now() + timedelta(days=1)
+        self.last_retry_after = None  # Store Retry-After from headers
+        self.consecutive_rate_limits = 0  # Track consecutive rate limits for progressive delay
         
         # Load Set-of-Marks JavaScript
         som_script_path = Path(__file__).parent / "set_of_marks.js"
@@ -121,6 +155,79 @@ class GhostPilot:
         print(f"✅ Tagged {result.get('tagCount', 0)} elements")
         return result
     
+    def _clean_json_response(self, response_text: str) -> str:
+        """Clean JSON response by removing comments and markdown"""
+        response_text = response_text.strip()
+        
+        # Remove markdown code blocks if present
+        if response_text.startswith("```"):
+            response_text = response_text.split("```")[1]
+            if response_text.startswith("json"):
+                response_text = response_text[4:]
+            response_text = response_text.strip()
+        
+        # Remove single-line comments (// ...)
+        response_text = re.sub(r'//[^\n]*', '', response_text)
+        
+        # Remove multi-line comments (/* ... */)
+        response_text = re.sub(r'/\*.*?\*/', '', response_text, flags=re.DOTALL)
+        
+        # Remove trailing commas before closing braces/brackets
+        response_text = re.sub(r',\s*([}\]])', r'\1', response_text)
+        
+        return response_text.strip()
+    
+    async def _check_rate_limits(self):
+        """Check and enforce rate limits for OpenRouter/Gemini free tier"""
+        if self.provider not in ["openrouter", "gemini"]:
+            return  # Only apply to free tier providers
+        
+        # Set limits based on provider
+        if self.provider == "gemini":
+            rpm_limit = 10  # Gemini 2.5 Flash: 10 RPM
+            daily_limit = 250  # Gemini 2.5 Flash: 250 RPD
+        else:  # openrouter
+            rpm_limit = 20  # OpenRouter: 20 RPM
+            daily_limit = 50  # OpenRouter: 50 RPD
+        
+        now = datetime.now()
+        
+        # Reset daily counter if needed
+        if now >= self.daily_reset_time:
+            self.daily_request_count = 0
+            self.daily_reset_time = now + timedelta(days=1)
+            print("📅 Daily rate limit reset")
+        
+        # Check daily limit
+        if self.daily_request_count >= daily_limit:
+            wait_seconds = (self.daily_reset_time - now).total_seconds()
+            print(f"🚫 Daily limit reached ({daily_limit} requests). Next reset in {wait_seconds/3600:.1f} hours")
+            raise Exception(f"Daily rate limit exceeded. Resets in {wait_seconds/3600:.1f} hours")
+        
+        # Check RPM limit
+        if len(self.request_timestamps) >= rpm_limit:
+            oldest_request = self.request_timestamps[0]
+            time_since_oldest = (now - oldest_request).total_seconds()
+            
+            if time_since_oldest < 60:
+                wait_time = 60 - time_since_oldest + 1  # Add 1 second buffer
+                print(f"⏳ Rate limit: {rpm_limit} RPM. Waiting {wait_time:.1f}s...")
+                await asyncio.sleep(wait_time)
+        
+        # Check if we need to honor Retry-After from previous request
+        if self.last_retry_after:
+            wait_until = self.last_retry_after
+            if now < wait_until:
+                wait_seconds = (wait_until - now).total_seconds()
+                print(f"⏳ Honoring Retry-After header. Waiting {wait_seconds:.1f}s...")
+                await asyncio.sleep(wait_seconds)
+            self.last_retry_after = None
+        
+        # Record this request
+        self.request_timestamps.append(now)
+        self.daily_request_count += 1
+        print(f"📊 Requests: {self.daily_request_count}/{daily_limit} daily, {len(self.request_timestamps)}/{rpm_limit} per minute")
+    
     async def get_screenshot(self) -> str:
         """Take screenshot and return as base64"""
         if not self.page:
@@ -129,9 +236,42 @@ class GhostPilot:
         screenshot_bytes = await self.page.screenshot(type="png")
         return base64.b64encode(screenshot_bytes).decode('utf-8')
     
+    async def detect_captcha(self) -> bool:
+        """Detect if current page has a captcha"""
+        if not self.page:
+            return False
+        
+        try:
+            # Check page content for common captcha keywords
+            page_content = await self.page.content()
+            captcha_keywords = [
+                'recaptcha', 'g-recaptcha', 'hcaptcha', 'h-captcha',
+                'captcha', 'verify you are human', 'prove you are human',
+                'security check', 'cloudflare', 'cf-challenge'
+            ]
+            
+            page_content_lower = page_content.lower()
+            for keyword in captcha_keywords:
+                if keyword in page_content_lower:
+                    print(f"🛡️ Captcha detected (keyword: '{keyword}')")
+                    return True
+            
+            # Check for common captcha iframes
+            captcha_frames = await self.page.query_selector_all('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="captcha"]')
+            if captcha_frames:
+                print(f"🛡️ Captcha iframe detected ({len(captcha_frames)} found)")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            print(f"⚠️ Captcha detection error: {e}")
+            return False
+
+    
     async def get_action_from_gpt(self, screenshot_base64: str, objective: str, viewport: Dict) -> Dict[str, Any]:
-        """Query GPT-4o Vision for next action with retry logic"""
-        print("🧠 Querying GPT-4o Vision...")
+        """Query vision model for next action with retry logic"""
+        print("🧠 Querying vision model...")
         
         # Build action history context
         history_context = ""
@@ -185,12 +325,96 @@ CRITICAL RULES:
 6. After typing in search box, click the search button or press enter
 7. Be decisive and make progress toward the objective"""
         
+        # Use Gemini's native API if Gemini provider
+        if self.provider == "gemini":
+            return await self._query_gemini(screenshot_base64, system_prompt)
+        else:
+            return await self._query_openai_compatible(screenshot_base64, system_prompt)
+    
+    async def _query_gemini(self, screenshot_base64: str, system_prompt: str) -> Dict[str, Any]:
+        """Query Google Gemini API"""
+        max_retries = 5
+        base_delay = 2
         
+        for attempt in range(max_retries):
+            try:
+                # Check rate limits before making request
+                await self._check_rate_limits()
+                
+                # Convert base64 to PIL Image for Gemini
+                import io
+                from PIL import Image
+                image_data = base64.b64decode(screenshot_base64)
+                image = Image.open(io.BytesIO(image_data))
+                
+                # Query Gemini
+                response = self.gemini_model.generate_content([system_prompt, image])
+                response_text = response.text.strip()
+                
+                # Clean and parse JSON
+                response_text = self._clean_json_response(response_text)
+                action = json.loads(response_text)
+                
+                print(f"💭 GEMINI: {action.get('thought', '')}")
+                print(f"⚡ Action: {action.get('action_type', '')} (confidence: {action.get('confidence', 0):.2f})")
+                
+                # Loop detection
+                if len(self.action_history) >= 2:
+                    last_action = self.action_history[-1]
+                    
+                    # Detect repeated clicks
+                    if (action.get('action_type') == last_action.get('action_type') == 'click' and
+                        action.get('tag_id') == last_action.get('tag_id')):
+                        print("🚨 LOOP DETECTED! Same click action repeated. Forcing different action...")
+                        action['action_type'] = 'type'
+                        action['text'] = action.get('thought', 'search').split()[-1]
+                        print(f"🔄 Overriding to: type '{action['text']}'")
+                    
+                    # Detect repeated typing
+                    elif (action.get('action_type') == last_action.get('action_type') == 'type' and
+                          action.get('text', '').lower() == last_action.get('text', '').lower()):
+                        print(f"🚨 LOOP DETECTED! Already typed '{action.get('text')}'. Forcing wait...")
+                        action['action_type'] = 'wait'
+                        action['duration'] = 1
+                        print("🔄 Overriding to: wait (page should auto-suggest)")
+                
+                # Store action in history
+                self.action_history.append(action)
+                return action
+                
+            except json.JSONDecodeError as e:
+                print(f"❌ Failed to parse Gemini response: {e}")
+                print(f"Raw response: {response_text}")
+                raise
+            except Exception as e:
+                error_str = str(e)
+                
+                # Rate limiting and retry logic (similar to OpenAI)
+                if "429" in error_str or "quota" in error_str.lower() or "rate" in error_str.lower():
+                    if attempt < max_retries - 1:
+                        wait_time = base_delay * (2 ** attempt)
+                        print(f"⏳ Rate limited! Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        print(f"❌ Rate limit exceeded after {max_retries} retries")
+                        raise
+                else:
+                    print(f"❌ Gemini query failed: {e}")
+                    raise
+        
+        raise Exception("Max retries exceeded")
+    
+    async def _query_openai_compatible(self, screenshot_base64: str, system_prompt: str) -> Dict[str, Any]:
+        """Query OpenAI-compatible APIs (OpenAI, OpenRouter, Custom, LM Studio)"""
         max_retries = 5
         base_delay = 2  # seconds
         
         for attempt in range(max_retries):
             try:
+                # Check rate limits before making request
+                await self._check_rate_limits()
+                
                 response = self.openai_client.chat.completions.create(
                     model=self.model_name,
                     messages=[
@@ -225,11 +449,8 @@ CRITICAL RULES:
                 
                 response_text = response_text.strip()
                 
-                # Remove markdown code blocks if present
-                if response_text.startswith("```"):
-                    response_text = response_text.split("```")[1]
-                    if response_text.startswith("json"):
-                        response_text = response_text[4:]
+                # Clean JSON response (removes comments, markdown, etc.)
+                response_text = self._clean_json_response(response_text)
                 
                 action = json.loads(response_text)
                 print(f"💭 {self.provider.upper()}: {action.get('thought', '')}")
@@ -238,17 +459,29 @@ CRITICAL RULES:
                 # Loop detection: prevent repeating the exact same action
                 if len(self.action_history) >= 2:
                     last_action = self.action_history[-1]
+                    
+                    # Detect repeated clicks
                     if (action.get('action_type') == last_action.get('action_type') == 'click' and
                         action.get('tag_id') == last_action.get('tag_id')):
                         print("🚨 LOOP DETECTED! Same click action repeated. Forcing different action...")
-                        
-                        # If we clicked an input field twice, force a type action
                         action['action_type'] = 'type'
-                        action['text'] = objective.split()[-1] if objective else 'amazon'  # Use last word of objective
+                        action['text'] = objective.split()[-1] if objective else 'search'
                         print(f"🔄 Overriding to: type '{action['text']}'")
+                    
+                    # Detect repeated typing of the same text
+                    elif (action.get('action_type') == last_action.get('action_type') == 'type' and
+                          action.get('text', '').lower() == last_action.get('text', '').lower()):
+                        print(f"🚨 LOOP DETECTED! Already typed '{action.get('text')}'. Forcing click action...")
+                        # Look for a search button or just press enter
+                        action['action_type'] = 'wait'
+                        action['duration'] = 1
+                        print("🔄 Overriding to: wait (page should auto-suggest)")
                 
                 # Store action in history
                 self.action_history.append(action)
+                
+                # Reset rate limit counter on successful request
+                self.consecutive_rate_limits = 0
                 
                 return action
                 
@@ -262,9 +495,30 @@ CRITICAL RULES:
                 # Check if it's a rate limit error (429)
                 if "429" in error_str or "Too Many Requests" in error_str or "rate_limit" in error_str.lower():
                     if attempt < max_retries - 1:
-                        # Exponential backoff: 2s, 4s, 8s, 16s, 32s
-                        wait_time = base_delay * (2 ** attempt)
-                        print(f"⏳ Rate limited! Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                        # Progressive delay: 10s, 20s, 30s based on consecutive rate limits
+                        self.consecutive_rate_limits += 1
+                        if self.consecutive_rate_limits == 1:
+                            wait_time = 10
+                        elif self.consecutive_rate_limits == 2:
+                            wait_time = 20
+                        else:
+                            wait_time = 30
+                        
+                        # Try to parse Retry-After header if available
+                        retry_after = None
+                        if hasattr(e, 'response') and hasattr(e.response, 'headers'):
+                            retry_after_header = e.response.headers.get('Retry-After')
+                            if retry_after_header:
+                                try:
+                                    retry_after = int(retry_after_header)
+                                    self.last_retry_after = datetime.now() + timedelta(seconds=retry_after)
+                                    wait_time = max(wait_time, retry_after)  # Use the longer delay
+                                    print(f"⏳ Rate limited! Server says wait {retry_after}s")
+                                except ValueError:
+                                    pass
+                        
+                        print(f"🚨 Rate limit hit (consecutive: {self.consecutive_rate_limits})")
+                        print(f"⏳ Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
                         await asyncio.sleep(wait_time)
                         continue
                     else:
@@ -383,6 +637,43 @@ CRITICAL RULES:
                     "screenshot": screenshot_b64
                 })
                 
+                # 2.5. Check for captcha
+                captcha_detected = await self.detect_captcha()
+                if captcha_detected:
+                    print("🛡️ CAPTCHA DETECTED - Pausing for human intervention")
+                    await websocket.send_json({
+                        "type": "captcha_detected",
+                        "message": "Captcha detected! Please solve it manually in the browser, then the agent will continue."
+                    })
+                    
+                    # Wait for captcha to be solved (check every 5 seconds)
+                    captcha_solved = False
+                    max_wait_attempts = 60  # Wait up to 5 minutes
+                    wait_attempt = 0
+                    
+                    while not captcha_solved and wait_attempt < max_wait_attempts:
+                        await asyncio.sleep(5)
+                        wait_attempt += 1
+                        captcha_still_present = await self.detect_captcha()
+                        
+                        if not captcha_still_present:
+                            captcha_solved = True
+                            print("✅ Captcha appears to be solved! Continuing...")
+                            await websocket.send_json({
+                                "type": "captcha_solved",
+                                "message": "Captcha solved! Continuing mission..."
+                            })
+                        else:
+                            if wait_attempt % 6 == 0:  # Log every 30 seconds
+                                print(f"⏳ Still waiting for captcha to be solved... ({wait_attempt * 5}s)")
+                    
+                    if not captcha_solved:
+                        print("⚠️ Captcha wait timeout - continuing anyway")
+                        await websocket.send_json({
+                            "type": "status",
+                            "message": "Captcha wait timeout - attempting to continue"
+                        })
+                
                 # 3. Query GPT-4o
                 await websocket.send_json({"type": "thinking", "thinking": True})
                 
@@ -445,8 +736,18 @@ CRITICAL RULES:
                 "message": "Max steps reached"
             })
     
-    async def cleanup(self):
-        """Clean up browser resources"""
+    async def cleanup(self, keep_browser_open: bool = True):
+        """Clean up browser resources
+        
+        Args:
+            keep_browser_open: If True, keeps browser window open for manual interaction.
+                              If False, closes everything (old behavior)
+        """
+        if keep_browser_open:
+            print("🌐 Browser will remain open for manual interaction")
+            print("   Close the browser window manually when done")
+            return
+        
         print("🧹 Cleaning up...")
         try:
             if self.page:
@@ -467,3 +768,4 @@ CRITICAL RULES:
             print(f"⚠️ Playwright cleanup warning: {e}")
         
         print("✅ Cleanup complete")
+

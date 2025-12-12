@@ -19,11 +19,11 @@
 
 @layer utilities {
   .glass {
-    @apply bg-ghost-surface/30 backdrop-blur-md border border-ghost-border/50;
+    @apply bg-ghost-surface/40 backdrop-blur-md border border-ghost-border/50;
   }
   
   .glass-strong {
-    @apply bg-ghost-surface/60 backdrop-blur-xl border border-ghost-border;
+    @apply bg-ghost-surface/70 backdrop-blur-xl border border-ghost-border;
   }
   
   .text-gradient {
@@ -36,6 +36,15 @@
   
   .smooth-transition {
     @apply transition-all duration-300 ease-out;
+  }
+  
+  /* Text visibility helpers */
+  .text-visible {
+    @apply text-gray-300;
+  }
+  
+  .text-visible-muted {
+    @apply text-gray-400;
   }
 }
 

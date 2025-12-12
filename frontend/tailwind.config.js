@@ -10,7 +10,7 @@ export default {
                 'ghost': {
                     bg: '#0a0a0f',
                     surface: '#151520',
-                    border: '#2a2a3e',
+                    border: '#9ca3af',  // Changed from #2a2a3e to gray-400 for better visibility
                     primary: '#00d9ff',
                     secondary: '#7c3aed',
                     accent: '#ffd700',

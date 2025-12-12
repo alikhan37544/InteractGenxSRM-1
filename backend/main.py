@@ -75,6 +75,19 @@ async def websocket_endpoint(websocket: WebSocket):
                         base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
                         model=os.getenv("OPENAI_MODEL", "gpt-4o")
                     )
+                elif provider == "gemini":
+                    # Google Gemini - Best free tier!
+                    pilot = GhostPilot(
+                        provider="gemini",
+                        api_key=os.getenv("GEMINI_API_KEY"),
+                        model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+                    )
+                elif provider == "openrouter":
+                    pilot = GhostPilot(
+                        provider="openrouter",
+                        api_key=os.getenv("OPENROUTER_API_KEY"),
+                        model=os.getenv("OPENROUTER_MODEL", "qwen/qwen2.5-vl-72b-instruct:free")
+                    )
                 elif provider == "custom":
                     pilot = GhostPilot(
                         provider="custom",
@@ -107,10 +120,10 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
                 
                 finally:
-                    # Cleanup
+                    # Keep browser open for manual interaction by default
                     if pilot:
-                        await pilot.cleanup()
-                        pilot = None
+                        await pilot.cleanup(keep_browser_open=True)
+                        # Note: pilot instance remains alive for potential future commands
     
     except WebSocketDisconnect:
         print("🔌 Client disconnected")
@@ -124,8 +137,9 @@ async def websocket_endpoint(websocket: WebSocket):
         except:
             pass
     finally:
+        # Keep browser open even on disconnect
         if pilot:
-            await pilot.cleanup()
+            await pilot.cleanup(keep_browser_open=True)
 
 if __name__ == "__main__":
     import uvicorn
