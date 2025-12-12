@@ -92,6 +92,7 @@ class GhostPilot:
         self.daily_reset_time = datetime.now() + timedelta(days=1)
         self.last_retry_after = None  # Store Retry-After from headers
         self.consecutive_rate_limits = 0  # Track consecutive rate limits for progressive delay
+        self.captcha_skip_requested = False  # Manual captcha override flag
         
         # Load Set-of-Marks JavaScript
         som_script_path = Path(__file__).parent / "set_of_marks.js"
@@ -237,30 +238,56 @@ class GhostPilot:
         return base64.b64encode(screenshot_bytes).decode('utf-8')
     
     async def detect_captcha(self) -> bool:
-        """Detect if current page has a captcha"""
+        """Detect if current page has a captcha - only visible challenges, not just script includes"""
         if not self.page:
             return False
         
         try:
-            # Check page content for common captcha keywords
-            page_content = await self.page.content()
-            captcha_keywords = [
-                'recaptcha', 'g-recaptcha', 'hcaptcha', 'h-captcha',
-                'captcha', 'verify you are human', 'prove you are human',
-                'security check', 'cloudflare', 'cf-challenge'
-            ]
+            # Check for VISIBLE captcha iframes (not just scripts in HTML)
+            captcha_iframes = await self.page.query_selector_all(
+                'iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="captcha"]'
+            )
             
-            page_content_lower = page_content.lower()
-            for keyword in captcha_keywords:
-                if keyword in page_content_lower:
-                    print(f"🛡️ Captcha detected (keyword: '{keyword}')")
+            for iframe in captcha_iframes:
+                # Check if iframe is actually visible
+                is_visible = await iframe.is_visible()
+                if is_visible:
+                    print(f"🛡️ Captcha iframe detected and visible")
                     return True
             
-            # Check for common captcha iframes
-            captcha_frames = await self.page.query_selector_all('iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="captcha"]')
-            if captcha_frames:
-                print(f"🛡️ Captcha iframe detected ({len(captcha_frames)} found)")
-                return True
+            # Check for visible captcha challenge elements
+            captcha_selectors = [
+                '.g-recaptcha',
+                '.h-captcha', 
+                '[id*="captcha"]',
+                '[class*="captcha-challenge"]',
+                '#challenge-form',  # Cloudflare
+                '.cf-challenge-running'  # Cloudflare
+            ]
+            
+            for selector in captcha_selectors:
+                elements = await self.page.query_selector_all(selector)
+                for element in elements:
+                    is_visible = await element.is_visible()
+                    if is_visible:
+                        print(f"🛡️ Captcha element detected: {selector}")
+                        return True
+            
+            # Check for very specific text that indicates an active challenge
+            page_text = await self.page.text_content('body') or ''
+            active_challenge_phrases = [
+                'verify you are human',
+                'prove you are human',
+                'please complete the security check',
+                'checking your browser',
+                'one more step'
+            ]
+            
+            page_text_lower = page_text.lower()
+            for phrase in active_challenge_phrases:
+                if phrase in page_text_lower:
+                    print(f"🛡️ Captcha challenge text detected: '{phrase}'")
+                    return True
             
             return False
             
@@ -295,9 +322,13 @@ class GhostPilot:
                     last_action.get('tag_id') == second_last.get('tag_id')):
                     history_context += "\n⚠️ WARNING: You just clicked the same element twice! If you clicked an input field, you MUST type next, not click again!\n"
         
+        # Get current URL for context
+        current_url = self.page.url if self.page else "unknown"
+        
         system_prompt = f"""You are Ghost Pilot, an autonomous browser navigation agent.
 
 OBJECTIVE: {objective}
+CURRENT URL: {current_url}
 
 You see a screenshot with yellow numbered tags on interactive elements.
 The viewport is {viewport['width']}x{viewport['height']}px.{history_context}
@@ -314,13 +345,14 @@ Respond ONLY with valid JSON (no markdown):
 }}
 
 CRITICAL RULES:
+0. **CHECK THE URL FIRST**: Look at CURRENT URL above. If you're already on the target website (e.g., youtube.com for "go to YouTube"), DO NOT navigate away! The objective may already be complete or you should use the current page.
 1. Look for yellow tags. Use tag_id when possible
 2. Use "finish" when objective is complete
 3. **TYPING WORKFLOW**: To type in an input field:
    - First action: click on the input field
    - NEXT action (after clicking): use "type" with the text to enter
    - If you just clicked an input, your NEXT action MUST be "type", NOT another click
-4. **NEVER REPEAT THE SAME ACTION**: Check your recent actions above. Do NOT click the same element multiple times in a row!
+4. **AVOID REPEATING ACTIONS**: Check your recent actions above. Try not to click the same element multiple times unless necessary.
 5. If element not visible, use "scroll"
 6. After typing in search box, click the search button or press enter
 7. Be decisive and make progress toward the objective"""
@@ -358,25 +390,19 @@ CRITICAL RULES:
                 print(f"💭 GEMINI: {action.get('thought', '')}")
                 print(f"⚡ Action: {action.get('action_type', '')} (confidence: {action.get('confidence', 0):.2f})")
                 
-                # Loop detection
+                # Loop detection - warn but allow LLM to learn
                 if len(self.action_history) >= 2:
                     last_action = self.action_history[-1]
                     
-                    # Detect repeated clicks
+                    # Detect repeated clicks - warn only
                     if (action.get('action_type') == last_action.get('action_type') == 'click' and
                         action.get('tag_id') == last_action.get('tag_id')):
-                        print("🚨 LOOP DETECTED! Same click action repeated. Forcing different action...")
-                        action['action_type'] = 'type'
-                        action['text'] = action.get('thought', 'search').split()[-1]
-                        print(f"🔄 Overriding to: type '{action['text']}'")
+                        print("⚠️ WARNING: LLM chose same click action. Allowing it (may be intentional for input focus).")
                     
-                    # Detect repeated typing
+                    # Detect repeated typing - warn only
                     elif (action.get('action_type') == last_action.get('action_type') == 'type' and
                           action.get('text', '').lower() == last_action.get('text', '').lower()):
-                        print(f"🚨 LOOP DETECTED! Already typed '{action.get('text')}'. Forcing wait...")
-                        action['action_type'] = 'wait'
-                        action['duration'] = 1
-                        print("🔄 Overriding to: wait (page should auto-suggest)")
+                        print(f"⚠️ WARNING: LLM chose to type '{action.get('text')}' again. Allowing it.")
                 
                 # Store action in history
                 self.action_history.append(action)
@@ -456,26 +482,19 @@ CRITICAL RULES:
                 print(f"💭 {self.provider.upper()}: {action.get('thought', '')}")
                 print(f"⚡ Action: {action.get('action_type', '')} (confidence: {action.get('confidence', 0):.2f})")
                 
-                # Loop detection: prevent repeating the exact same action
+                # Loop detection - warn but allow LLM to learn
                 if len(self.action_history) >= 2:
                     last_action = self.action_history[-1]
                     
-                    # Detect repeated clicks
+                    # Detect repeated clicks - warn only
                     if (action.get('action_type') == last_action.get('action_type') == 'click' and
                         action.get('tag_id') == last_action.get('tag_id')):
-                        print("🚨 LOOP DETECTED! Same click action repeated. Forcing different action...")
-                        action['action_type'] = 'type'
-                        action['text'] = objective.split()[-1] if objective else 'search'
-                        print(f"🔄 Overriding to: type '{action['text']}'")
+                        print("⚠️ WARNING: LLM chose same click action. Allowing it (may be intentional for input focus).")
                     
-                    # Detect repeated typing of the same text
+                    # Detect repeated typing - warn only
                     elif (action.get('action_type') == last_action.get('action_type') == 'type' and
                           action.get('text', '').lower() == last_action.get('text', '').lower()):
-                        print(f"🚨 LOOP DETECTED! Already typed '{action.get('text')}'. Forcing click action...")
-                        # Look for a search button or just press enter
-                        action['action_type'] = 'wait'
-                        action['duration'] = 1
-                        print("🔄 Overriding to: wait (page should auto-suggest)")
+                        print(f"⚠️ WARNING: LLM chose to type '{action.get('text')}' again. Allowing it.")
                 
                 # Store action in history
                 self.action_history.append(action)
@@ -652,6 +671,17 @@ CRITICAL RULES:
                     wait_attempt = 0
                     
                     while not captcha_solved and wait_attempt < max_wait_attempts:
+                        # Check FIRST if user manually skipped (this is critical!)
+                        if self.captcha_skip_requested:
+                            print("⚡ Captcha wait manually skipped by user")
+                            self.captcha_skip_requested = False  # Reset flag
+                            captcha_solved = True  # Mark as solved to exit loop
+                            await websocket.send_json({
+                                "type": "captcha_solved",
+                                "message": "Captcha wait skipped by user - continuing mission"
+                            })
+                            break  # Exit immediately
+                        
                         await asyncio.sleep(5)
                         wait_attempt += 1
                         captcha_still_present = await self.detect_captcha()

@@ -26,7 +26,7 @@ export function GhostCursor({ x, y, isThinking = false }: GhostCursorProps) {
 
     return (
         <motion.div
-            className="fixed pointer-events-none z-[9999]"
+            className="absolute pointer-events-none z-[9999]"
             style={{ left: -12, top: -12 }} // Offset for cursor tip
             animate={controls}
         >

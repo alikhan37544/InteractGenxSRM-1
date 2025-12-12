@@ -19,7 +19,7 @@ export function ClickRipple({ x, y, timestamp }: ClickRippleProps) {
         <AnimatePresence>
             {show && (
                 <motion.div
-                    className="fixed pointer-events-none z-[9998]"
+                    className="absolute pointer-events-none z-[9998]"
                     style={{ left: x - 24, top: y - 24 }}
                     initial={{ scale: 0, opacity: 1 }}
                     animate={{ scale: 4, opacity: 0 }}

@@ -124,6 +124,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     if pilot:
                         await pilot.cleanup(keep_browser_open=True)
                         # Note: pilot instance remains alive for potential future commands
+            
+            elif message.get("type") == "skip_captcha":
+                # Handle manual captcha override
+                if pilot:
+                    print("⚡ Received skip captcha request from user")
+                    pilot.captcha_skip_requested = True
+                    await websocket.send_json({
+                        "type": "status",
+                        "message": "Skipping captcha wait..."
+                    })
     
     except WebSocketDisconnect:
         print("🔌 Client disconnected")

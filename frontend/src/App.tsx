@@ -6,6 +6,7 @@ import { ClickRipple } from './components/ClickRipple';
 import { ThinkingOverlay } from './components/ThinkingOverlay';
 import { VideoStream } from './components/VideoStream';
 import { VoiceInput } from './components/VoiceInput';
+import { useSpeechSynthesis } from './hooks/useSpeechSynthesis';
 
 // WebSocket URL - adjust if your backend is on a different port
 const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws';
@@ -19,12 +20,14 @@ function App() {
     const [status, setStatus] = useState('Ready');
     const [currentObjective, setCurrentObjective] = useState('');
     const [clickRipple, setClickRipple] = useState<{ x: number, y: number, timestamp: number } | null>(null);
+    const [captchaDetected, setCaptchaDetected] = useState(false);
+    const { speak } = useSpeechSynthesis();
 
     // Handle incoming WebSocket messages
     useEffect(() => {
         if (!lastMessage) return;
 
-        switch (lastMessage.type) {
+        switch ((lastMessage as any).type) {
             case 'screenshot':
                 if (lastMessage.screenshot) {
                     setScreenshot(lastMessage.screenshot);
@@ -38,9 +41,30 @@ function App() {
                 break;
 
             case 'action':
+                // Handle click actions
                 if (lastMessage.action_type === 'click' && lastMessage.x !== undefined && lastMessage.y !== undefined) {
                     setClickRipple({ x: lastMessage.x, y: lastMessage.y, timestamp: Date.now() });
+                    speak('Clicking');
                 }
+                // Handle type actions
+                else if (lastMessage.action_type === 'type') {
+                    const textToType = lastMessage.data?.text || '';
+                    if (textToType) {
+                        speak(`Typing: ${textToType}`);
+                    } else {
+                        speak('Typing');
+                    }
+                }
+                // Handle scroll actions
+                else if (lastMessage.action_type === 'scroll') {
+                    const direction = lastMessage.data?.scroll_direction || 'down';
+                    speak(`Scrolling ${direction}`);
+                }
+                // Handle wait actions
+                else if (lastMessage.action_type === 'wait') {
+                    speak('Waiting');
+                }
+
                 if (lastMessage.data?.message) {
                     setStatus(lastMessage.data.message);
                 }
@@ -48,38 +72,105 @@ function App() {
 
             case 'thinking':
                 setIsThinking(lastMessage.thinking || false);
+                if (lastMessage.thinking) {
+                    speak('Analyzing page');
+                }
                 break;
 
             case 'status':
                 if (lastMessage.message) {
                     setStatus(lastMessage.message);
+                    // Speak major status updates
+                    if (lastMessage.message.includes('Initializing') ||
+                        lastMessage.message.includes('Loaded') ||
+                        lastMessage.message.includes('Navigating') ||
+                        lastMessage.message.includes('complete')) {
+                        speak(lastMessage.message);
+                    }
+                }
+                break;
+
+            case 'captcha_detected':
+                setCaptchaDetected(true);
+                if (lastMessage.message) {
+                    setStatus(lastMessage.message);
+                    speak('Captcha detected. Please solve it manually, then I will continue.');
+                }
+                break;
+
+            case 'captcha_solved':
+                setCaptchaDetected(false);
+                if (lastMessage.message) {
+                    setStatus(lastMessage.message);
+                    speak('Captcha solved. Continuing mission.');
                 }
                 break;
 
             case 'complete':
                 setIsThinking(false);
                 setStatus('Mission complete! 🎉');
+                speak('Mission complete!');
                 break;
 
             case 'error':
                 setIsThinking(false);
                 if (lastMessage.error) {
                     setStatus(`Error: ${lastMessage.error}`);
+                    speak(`Error occurred: ${lastMessage.error}`);
                 }
                 break;
         }
     }, [lastMessage]);
 
+    const extractUrl = (text: string): string | null => {
+        // Remove common command prefixes
+        const cleanedText = text.toLowerCase()
+            .replace(/^(go to|open|navigate to|visit|search for)\s+/i, '');
+
+        // Check for explicit URL with protocol
+        const urlWithProtocol = cleanedText.match(/https?:\/\/[^\s]+/);
+        if (urlWithProtocol) {
+            return urlWithProtocol[0];
+        }
+
+        // Check for domain-like patterns (e.g., "youtube.com", "github.com")
+        const domainPattern = /\b([a-z0-9-]+\.)+[a-z]{2,}\b/i;
+        const domainMatch = cleanedText.match(domainPattern);
+        if (domainMatch) {
+            return `https://${domainMatch[0]}`;
+        }
+
+        return null;
+    };
+
     const handleVoiceCommand = (transcript: string) => {
         console.log('📝 Voice command:', transcript);
         setCurrentObjective(transcript);
-        setStatus(`Starting mission: ${transcript}`);
+
+        // Try to extract URL from the command
+        const detectedUrl = extractUrl(transcript);
+        const startUrl = detectedUrl || 'https://www.google.com';
+
+        if (detectedUrl) {
+            console.log('🔗 Detected URL:', detectedUrl);
+            setStatus(`Navigating to ${detectedUrl}...`);
+        } else {
+            setStatus(`Starting mission: ${transcript}`);
+        }
 
         sendMessage({
             type: 'start_mission',
             objective: transcript,
-            url: 'https://www.google.com' // Default starting URL
+            url: startUrl
         });
+    };
+
+    const handleSkipCaptcha = () => {
+        console.log('⚡ Manually skipping captcha wait');
+        sendMessage({
+            type: 'skip_captcha'
+        });
+        setCaptchaDetected(false);
     };
 
     return (
@@ -169,6 +260,29 @@ function App() {
                                 )}
                             </div>
                         </div>
+
+                        {/* Captcha Override Button - appears when captcha detected */}
+                        <AnimatePresence>
+                            {captchaDetected && (
+                                <motion.button
+                                    onClick={handleSkipCaptcha}
+                                    className="glass-strong px-6 py-3 rounded-lg border-2 border-ghost-accent hover:bg-ghost-accent/20 transition-colors"
+                                    initial={{ opacity: 0, scale: 0.9 }}
+                                    animate={{ opacity: 1, scale: 1 }}
+                                    exit={{ opacity: 0, scale: 0.9 }}
+                                    whileHover={{ scale: 1.02 }}
+                                    whileTap={{ scale: 0.98 }}
+                                >
+                                    <div className="flex items-center gap-3">
+                                        <span className="text-2xl">🛡️</span>
+                                        <div className="text-left">
+                                            <p className="text-sm font-bold text-ghost-accent uppercase tracking-wide">Manual Override</p>
+                                            <p className="text-xs text-gray-400">Click to skip captcha wait</p>
+                                        </div>
+                                    </div>
+                                </motion.button>
+                            )}
+                        </AnimatePresence>
 
                         {/* Status bar */}
                         <div className="glass px-4 py-3 rounded-lg">

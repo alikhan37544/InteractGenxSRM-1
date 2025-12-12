@@ -1,78 +1,172 @@
 import { useState, useEffect, useRef } from 'react';
 import { motion } from 'framer-motion';
+import { useSpeechSynthesis } from '../hooks/useSpeechSynthesis';
+import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 
 interface VoiceInputProps {
     onTranscript: (text: string) => void;
     isConnected: boolean;
 }
 
-// Check if Web Speech API is available
-const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+const DEEPGRAM_API_KEY = import.meta.env.VITE_DEEPGRAM_API_KEY;
 
 export function VoiceInput({ onTranscript, isConnected }: VoiceInputProps) {
     const [isListening, setIsListening] = useState(false);
     const [transcript, setTranscript] = useState('');
     const [manualInput, setManualInput] = useState('');
-    const recognitionRef = useRef<any>(null);
+    const { speak } = useSpeechSynthesis();
 
-    const hasVoiceSupport = !!SpeechRecognition;
+    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+    const deepgramRef = useRef<any>(null);
+    const streamRef = useRef<MediaStream | null>(null);
+    const transcriptTimeoutRef = useRef<any>(null);
+
+    const hasDeepgramKey = !!DEEPGRAM_API_KEY && DEEPGRAM_API_KEY !== 'your_deepgram_api_key_here';
 
     useEffect(() => {
-        if (!hasVoiceSupport) return;
-
-        const recognition = new SpeechRecognition();
-        recognition.continuous = false;
-        recognition.interimResults = true;
-        recognition.lang = 'en-US';
-
-        recognition.onresult = (event: any) => {
-            let interimTranscript = '';
-            let finalTranscript = '';
-
-            for (let i = event.resultIndex; i < event.results.length; i++) {
-                const transcriptPiece = event.results[i][0].transcript;
-                if (event.results[i].isFinal) {
-                    finalTranscript += transcriptPiece + ' ';
-                } else {
-                    interimTranscript += transcriptPiece;
-                }
-            }
-
-            const currentTranscript = finalTranscript || interimTranscript;
-            setTranscript(currentTranscript.trim());
-        };
-
-        recognition.onend = () => {
-            setIsListening(false);
-            if (transcript) {
-                onTranscript(transcript);
-                setTranscript('');
-            }
-        };
-
-        recognition.onerror = (event: any) => {
-            console.error('Speech recognition error:', event.error);
-            setIsListening(false);
-        };
-
-        recognitionRef.current = recognition;
-
         return () => {
-            if (recognitionRef.current) {
-                recognitionRef.current.stop();
+            // Cleanup on unmount
+            if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+                mediaRecorderRef.current.stop();
+            }
+            if (streamRef.current) {
+                streamRef.current.getTracks().forEach(track => track.stop());
+            }
+            if (deepgramRef.current) {
+                deepgramRef.current.finish();
             }
         };
-    }, [hasVoiceSupport, transcript, onTranscript]);
+    }, []);
+
+    const startListening = async () => {
+        if (!hasDeepgramKey) {
+            alert('Deepgram API key not configured. Please add VITE_DEEPGRAM_API_KEY to your .env file');
+            return;
+        }
+
+        try {
+            // Request microphone access
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            streamRef.current = stream;
+
+            // Create Deepgram client
+            const deepgram = createClient(DEEPGRAM_API_KEY);
+
+            // Create live transcription connection
+            const connection = deepgram.listen.live({
+                model: 'nova-2',
+                language: 'en-US',
+                smart_format: true,
+                interim_results: true,
+                punctuate: true,
+            });
+
+            deepgramRef.current = connection;
+
+            // Handle transcription results
+            connection.on(LiveTranscriptionEvents.Transcript, (data: any) => {
+                const transcriptText = data.channel?.alternatives?.[0]?.transcript;
+
+                if (transcriptText && transcriptText.trim()) {
+                    setTranscript(transcriptText);
+
+                    // If this is a final transcript, set a timeout to finalize
+                    if (data.is_final) {
+                        if (transcriptTimeoutRef.current) {
+                            clearTimeout(transcriptTimeoutRef.current);
+                        }
+
+                        transcriptTimeoutRef.current = setTimeout(() => {
+                            if (transcriptText.trim()) {
+                                stopListening(transcriptText);
+                            }
+                        }, 1500); // Finalize after 1.5s of no new final transcripts
+                    }
+                }
+            });
+
+            connection.on(LiveTranscriptionEvents.Error, (error: any) => {
+                console.error('Deepgram error:', error);
+                speak('Sorry, there was an error with voice recognition');
+                stopListening();
+            });
+
+            // Open the connection
+            connection.on(LiveTranscriptionEvents.Open, () => {
+                console.log('Deepgram connection opened');
+                setIsListening(true);
+                speak('Listening', true);
+
+                // Create MediaRecorder to send audio to Deepgram
+                const mediaRecorder = new MediaRecorder(stream, {
+                    mimeType: 'audio/webm',
+                });
+
+                mediaRecorderRef.current = mediaRecorder;
+
+                mediaRecorder.ondataavailable = (event) => {
+                    if (event.data.size > 0 && connection.getReadyState() === 1) {
+                        connection.send(event.data);
+                    }
+                };
+
+                mediaRecorder.start(250); // Send data every 250ms
+            });
+
+            connection.on(LiveTranscriptionEvents.Close, () => {
+                console.log('Deepgram connection closed');
+                setIsListening(false);
+            });
+
+        } catch (error: any) {
+            console.error('Error starting voice input:', error);
+            if (error.name === 'NotAllowedError') {
+                speak('Please allow microphone access to use voice input');
+            } else {
+                speak('Sorry, could not access microphone');
+            }
+            setIsListening(false);
+        }
+    };
+
+    const stopListening = (finalTranscript?: string) => {
+        // Stop media recorder
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+            mediaRecorderRef.current.stop();
+        }
+
+        // Stop media stream
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach(track => track.stop());
+            streamRef.current = null;
+        }
+
+        // Close Deepgram connection
+        if (deepgramRef.current) {
+            deepgramRef.current.finish();
+            deepgramRef.current = null;
+        }
+
+        setIsListening(false);
+
+        // Process transcript
+        const textToSend = finalTranscript || transcript;
+        if (textToSend.trim()) {
+            speak(`I heard: ${textToSend}`);
+            onTranscript(textToSend);
+            setTranscript('');
+        }
+
+        if (transcriptTimeoutRef.current) {
+            clearTimeout(transcriptTimeoutRef.current);
+        }
+    };
 
     const toggleListening = () => {
-        if (!recognitionRef.current) return;
-
         if (isListening) {
-            recognitionRef.current.stop();
+            stopListening();
         } else {
-            setTranscript('');
-            recognitionRef.current.start();
-            setIsListening(true);
+            startListening();
         }
     };
 
@@ -88,7 +182,7 @@ export function VoiceInput({ onTranscript, isConnected }: VoiceInputProps) {
         <div className="glass-strong rounded-2xl p-6">
             <div className="flex flex-col gap-4">
                 {/* Voice Input */}
-                {hasVoiceSupport ? (
+                {hasDeepgramKey ? (
                     <div className="flex flex-col items-center gap-4">
                         <motion.button
                             onClick={toggleListening}
@@ -151,11 +245,11 @@ export function VoiceInput({ onTranscript, isConnected }: VoiceInputProps) {
                             </svg>
                         </motion.button>
 
-                        <p className="text-sm font-medium text-ghost-border">
+                        <p className="text-sm font-medium text-gray-400">
                             {!isConnected
                                 ? 'Connecting to backend...'
                                 : isListening
-                                    ? 'Listening...'
+                                    ? 'Listening... (Click to stop)'
                                     : 'Click to speak'
                             }
                         </p>
@@ -174,9 +268,12 @@ export function VoiceInput({ onTranscript, isConnected }: VoiceInputProps) {
                         )}
                     </div>
                 ) : (
-                    <p className="text-center text-ghost-border text-sm">
-                        Voice input not supported in this browser
-                    </p>
+                    <div className="text-center">
+                        <p className="text-ghost-danger text-sm mb-2">⚠️ Deepgram API key not configured</p>
+                        <p className="text-gray-400 text-xs">
+                            Add VITE_DEEPGRAM_API_KEY to your .env file
+                        </p>
+                    </div>
                 )}
 
                 {/* Divider */}
@@ -185,7 +282,7 @@ export function VoiceInput({ onTranscript, isConnected }: VoiceInputProps) {
                         <div className="w-full border-t border-ghost-border/30" />
                     </div>
                     <div className="relative flex justify-center text-xs">
-                        <span className="px-2 bg-ghost-surface text-ghost-border">OR</span>
+                        <span className="px-2 bg-ghost-surface text-gray-400">OR</span>
                     </div>
                 </div>
 
@@ -199,7 +296,7 @@ export function VoiceInput({ onTranscript, isConnected }: VoiceInputProps) {
                         disabled={!isConnected}
                         className="
               flex-1 px-4 py-3 rounded-lg bg-ghost-surface border border-ghost-border
-              text-white placeholder-ghost-border/50 focus:outline-none focus:border-ghost-primary
+              text-white placeholder-gray-500 focus:outline-none focus:border-ghost-primary
               transition-colors disabled:opacity-50 disabled:cursor-not-allowed
             "
                     />
