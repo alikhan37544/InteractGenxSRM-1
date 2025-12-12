@@ -60,10 +60,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
                 
                 # Initialize Ghost Pilot
-                pilot = GhostPilot(
-                    openai_api_key=os.getenv("OPENAI_API_KEY"),
-                    openai_base_url=os.getenv("OPENAI_BASE_URL")
-                )
+                provider = os.getenv("LLM_PROVIDER", "lmstudio").lower()
+                
+                if provider == "lmstudio":
+                    pilot = GhostPilot(
+                        provider="lmstudio",
+                        base_url=os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1"),
+                        model=os.getenv("LM_STUDIO_MODEL", "llava-v1.6-34b")
+                    )
+                elif provider == "openai":
+                    pilot = GhostPilot(
+                        provider="openai",
+                        api_key=os.getenv("OPENAI_API_KEY"),
+                        base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+                        model=os.getenv("OPENAI_MODEL", "gpt-4o")
+                    )
+                elif provider == "custom":
+                    pilot = GhostPilot(
+                        provider="custom",
+                        api_key=os.getenv("OPENAI_API_KEY"),
+                        base_url=os.getenv("OPENAI_BASE_URL"),
+                        model=os.getenv("OPENAI_MODEL", "gpt-4o")
+                    )
+                else:
+                    raise ValueError(f"Invalid LLM_PROVIDER: {provider}")
                 
                 try:
                     # Run the mission
@@ -89,7 +109,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 finally:
                     # Cleanup
                     if pilot:
-                        pilot.cleanup()
+                        await pilot.cleanup()
                         pilot = None
     
     except WebSocketDisconnect:
@@ -105,7 +125,7 @@ async def websocket_endpoint(websocket: WebSocket):
             pass
     finally:
         if pilot:
-            pilot.cleanup()
+            await pilot.cleanup()
 
 if __name__ == "__main__":
     import uvicorn
