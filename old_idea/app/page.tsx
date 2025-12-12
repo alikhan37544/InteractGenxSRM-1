@@ -8,6 +8,7 @@ import { WarRoomInput } from "@/components/WarRoomInput";
 import { WarRoomResults } from "@/components/WarRoomResults";
 import { WinRateChart } from "@/components/WinRateChart";
 import { StrategyCard } from "@/components/StrategyCard";
+import { ComprehensiveMetricsDashboard } from "@/components/ComprehensiveMetricsDashboard";
 import { ToastProvider, useToast } from "@/components/ui/toast";
 import { useSettingsStore } from "@/store/settings-store";
 import { aiService } from "@/lib/ai-service";
@@ -246,11 +247,12 @@ function DashboardContent() {
       setStreamingPersona(undefined);
       setStreamingContent("");
 
-      // Analyze results
-      const analysisResult = analyzeResults(
+      // Analyze results (using LLM for sentiment analysis)
+      const analysisResult = await analyzeResults(
         results,
         data.brand,
-        data.competitor
+        data.competitor,
+        modelToUse
       );
       setAnalysis(analysisResult);
     } catch (error: any) {
@@ -316,6 +318,11 @@ function DashboardContent() {
                   <>
                     <WinRateChart
                       winRate={analysis.winRate}
+                      brand={simulationData.brand}
+                      competitor={simulationData.competitor}
+                    />
+                    <ComprehensiveMetricsDashboard
+                      analysis={analysis}
                       brand={simulationData.brand}
                       competitor={simulationData.competitor}
                     />

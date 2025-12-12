@@ -1,0 +1,97 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-ghost-border;
+  }
+  
+  body {
+    @apply bg-ghost-bg text-white antialiased;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+  
+  code, pre {
+    font-family: 'JetBrains Mono', 'Courier New', monospace;
+  }
+}
+
+@layer utilities {
+  .glass {
+    @apply bg-ghost-surface/30 backdrop-blur-md border border-ghost-border/50;
+  }
+  
+  .glass-strong {
+    @apply bg-ghost-surface/60 backdrop-blur-xl border border-ghost-border;
+  }
+  
+  .text-gradient {
+    @apply bg-gradient-to-r from-ghost-primary via-ghost-secondary to-ghost-accent bg-clip-text text-transparent;
+  }
+  
+  .glow-border {
+    @apply border-ghost-primary shadow-[0_0_15px_rgba(0,217,255,0.3)];
+  }
+  
+  .smooth-transition {
+    @apply transition-all duration-300 ease-out;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-ghost-surface;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-ghost-border rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-ghost-primary/50;
+}
+
+/* Animations */
+@keyframes radar-ping {
+  0% {
+    transform: scale(0.8);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(2.5);
+    opacity: 0;
+  }
+}
+
+@keyframes ripple {
+  0% {
+    transform: scale(0);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(4);
+    opacity: 0;
+  }
+}
+
+.radar-ping {
+  animation: radar-ping 2s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+.ripple {
+  animation: ripple 0.6s cubic-bezier(0, 0, 0.2, 1);
+}
+
+/* Disable text selection for UI elements */
+.no-select {
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
+}

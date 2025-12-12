@@ -58,7 +58,7 @@ const FREE_MODELS = [
 
 export const DEFAULT_OPENROUTER_MODEL = FREE_MODELS[0];
 export const DEFAULT_LOCAL_BASE_URL = "http://localhost:1234/v1";
-export const DEFAULT_LOCAL_MODEL_ID = "local-model";
+export const DEFAULT_LOCAL_MODEL_ID = "google/gemma-3-1b";
 export const DEFAULT_GEMINI_MODEL = "gemini-1.5-flash";
 
 export const useSettingsStore = create<SettingsState>()(

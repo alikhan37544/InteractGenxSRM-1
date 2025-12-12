@@ -9,16 +9,29 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
-import { Play, Download, Terminal, Layers, Code, FileJson, Sparkles } from "lucide-react";
+import { Play, Sparkles, Download, FileJson, X, Globe, Terminal, Loader2, MousePointer2, Brain, Code, Layers } from "lucide-react";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { motion, AnimatePresence } from "framer-motion";
 
 interface ExtractedElement {
   type: string;
-  content: { text: string; placeholder: string | null };
-  selectors: { css: string; xpath: string; id: string | null };
-  attributes: { href: string | null; src: string | null; name: string | null };
-  geometry: { x: number; y: number };
+  content: {
+    text: string;
+    placeholder?: string | null;
+  };
+  llm_context?: string;
+  selectors: {
+    css: string;
+    id: string | null;
+  };
+  attributes: {
+    href?: string | null;
+    src?: string | null;
+  };
+  geometry: {
+    x: number;
+    y: number;
+  };
 }
 
 interface LogEntry {
@@ -27,12 +40,68 @@ interface LogEntry {
   type: 'info' | 'success' | 'error';
 }
 
+const ElementAction = ({ el, onInteract, isInteracting }: { el: ExtractedElement, onInteract: any, isInteracting: boolean }) => {
+  const [val, setVal] = useState("");
+
+  if (el.type === 'BUTTON' || el.type === 'LINK') {
+    return (
+      <Button
+        size="sm"
+        variant="ghost"
+        className="h-6 text-[10px] bg-neutral-800 hover:bg-indigo-600 text-neutral-400 hover:text-white mt-1"
+        onClick={() => onInteract(el.selectors.css, 'click')}
+        disabled={isInteracting}
+      >
+        Click
+      </Button>
+    );
+  }
+
+  if (el.type === 'INPUT') {
+    return (
+      <div className="flex items-center gap-1 mt-1">
+        <Input
+          className="h-6 w-32 text-[10px] bg-neutral-900 border-neutral-700"
+          placeholder="Type here..."
+          value={val}
+          onChange={(e) => setVal(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              onInteract(el.selectors.css, 'fill', val);
+              setVal("");
+            }
+          }}
+          disabled={isInteracting}
+        />
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-6 w-6 p-0 bg-neutral-800 hover:bg-emerald-600 text-neutral-400 hover:text-white"
+          onClick={() => {
+            onInteract(el.selectors.css, 'fill', val);
+            setVal("");
+          }}
+          disabled={isInteracting}
+        >
+          <Sparkles className="h-3 w-3" />
+        </Button>
+      </div>
+    );
+  }
+
+  return null;
+};
+
 export default function Home() {
   const [url, setUrl] = useState("");
-  const [isHeadless, setIsHeadless] = useState(true);
+  const [isHeadless, setIsHeadless] = useState(false); // Default to false (headed) for interactive mode visibility
+  const [forceRefresh, setForceRefresh] = useState(false);
   const [isExtracting, setIsExtracting] = useState(false);
+  const [isInteracting, setIsInteracting] = useState(false);
+  const [isEnriching, setIsEnriching] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [elements, setElements] = useState<ExtractedElement[]>([]);
+  const [meta, setMeta] = useState<any>(null);
   const [activeTab, setActiveTab] = useState("table");
 
   const addLog = (message: string, type: 'info' | 'success' | 'error' = 'info') => {
@@ -46,32 +115,92 @@ export default function Home() {
     }
 
     setIsExtracting(true);
-    setLogs([]);
+    setLogs([]); // Keep old logs? Maybe clear for new session.
     setElements([]);
-    addLog(`Starting extraction for ${url}...`);
+    setMeta(null);
+    addLog(`Starting session for ${url} (Force Refresh: ${forceRefresh})...`);
 
     try {
-      const response = await fetch("/api/extract", {
+      const response = await fetch("/api/session/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, headless: isHeadless }),
+        body: JSON.stringify({ url, headless: isHeadless, forceRefresh }),
       });
 
-      if (!response.body) {
-        throw new Error("No response body");
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || "Request failed");
       }
 
       const data = await response.json();
 
-      if (data.error) throw new Error(data.error);
-
       setElements(data.elements);
-      addLog(`Extraction complete. Found ${data.elements.length} elements.`, "success");
+      setMeta(data.meta);
+      const source = data.meta.cached ? "Database Cache" : "Live Browser";
+      addLog(`Session started. Loaded ${data.elements.length} elements from ${source}.`, "success");
 
     } catch (error: any) {
-      addLog(`Extraction failed: ${error.message}`, "error");
+      addLog(`Session failed: ${error.message}`, "error");
     } finally {
       setIsExtracting(false);
+    }
+  };
+
+  const handleInteraction = async (selector: string, action: 'click' | 'fill', value?: string) => {
+    setIsInteracting(true);
+    addLog(`${action === 'click' ? 'Clicking' : 'Filling'} element: ${selector}${value ? ` with "${value}"` : ''}`, "info");
+    try {
+      const response = await fetch("/api/session/interact", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ selector, action, value, url }), // Send URL for session recovery
+      });
+
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || "Interaction failed");
+      }
+
+      const data = await response.json();
+      setElements(data.elements);
+      setMeta({ ...meta, source_url: data.meta.source_url }); // Update URL if changed
+      addLog(`Interaction complete. URL is now: ${data.meta.source_url}`, "success");
+    } catch (error: any) {
+      addLog(`Interaction error: ${error.message}`, "error");
+    } finally {
+      setIsInteracting(false);
+    }
+  };
+
+  const handleEnrich = async () => {
+    if (!url || elements.length === 0) {
+      addLog("No elements to enrich. Start session first.", "error");
+      return;
+    }
+
+    setIsEnriching(true);
+    addLog("Starting AI enrichment with Gemma 3 1b...", "info");
+
+    try {
+      const response = await fetch("/api/ai/enrich", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+
+      if (!response.ok) {
+        const err = await response.json();
+        throw new Error(err.error || "Enrichment failed");
+      }
+
+      const data = await response.json();
+      setElements(data.elements);
+      addLog(`Enrichment complete. Context added to elements.`, "success");
+
+    } catch (error: any) {
+      addLog(`Enrichment error: ${error.message}`, "error");
+    } finally {
+      setIsEnriching(false);
     }
   };
 
@@ -164,6 +293,16 @@ export default function Home() {
                     />
                   </div>
 
+                  <div className="flex items-center justify-between p-3 rounded-lg bg-neutral-950/50 border border-neutral-800/50 hover:border-neutral-700/50 transition-colors">
+                    <Label htmlFor="refresh" className="text-sm font-medium text-neutral-400 cursor-pointer">Force Refresh</Label>
+                    <Switch
+                      id="refresh"
+                      checked={forceRefresh}
+                      onCheckedChange={setForceRefresh}
+                      className="data-[state=checked]:bg-indigo-500"
+                    />
+                  </div>
+
                   <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }}>
                     <Button
                       className="w-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-900/20 font-semibold tracking-wide"
@@ -178,16 +317,43 @@ export default function Home() {
                             transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
                             className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full"
                           />
-                          Processing...
+                          Starting Session...
                         </div>
                       ) : (
                         <>
                           <Sparkles className="w-4 h-4 mr-2" />
-                          Start Extraction
+                          Start / Connect
                         </>
                       )}
                     </Button>
                   </motion.div>
+
+                  {elements.length > 0 && (
+                    <motion.div whileHover={{ scale: 1.02 }} whileTap={{ scale: 0.98 }} className="mt-3">
+                      <Button
+                        className="w-full bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-900/20 font-semibold tracking-wide"
+                        size="lg"
+                        onClick={handleEnrich}
+                        disabled={isEnriching}
+                      >
+                        {isEnriching ? (
+                          <div className="flex items-center gap-2">
+                            <motion.div
+                              animate={{ rotate: 360 }}
+                              transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
+                              className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full"
+                            />
+                            Analyzing Context...
+                          </div>
+                        ) : (
+                          <>
+                            <Brain className="w-4 h-4 mr-2" />
+                            Analyze Page with AI
+                          </>
+                        )}
+                      </Button>
+                    </motion.div>
+                  )}
                 </CardContent>
               </Card>
             </motion.div>
@@ -251,6 +417,9 @@ export default function Home() {
                   <CardTitle className="text-lg flex items-center gap-2">
                     <FileJson className="w-5 h-5 text-emerald-400" />
                     Extraction Results
+                    {meta?.cached && (
+                      <Badge variant="secondary" className="ml-2 bg-neutral-800 text-neutral-400 text-[10px]">Cached</Badge>
+                    )}
                   </CardTitle>
                   <CardDescription className="text-neutral-400">
                     {elements.length > 0
@@ -284,67 +453,86 @@ export default function Home() {
 
                   <TabsContent value="table" className="flex-1 p-0 m-0 relative overflow-hidden flex flex-col">
                     <ScrollArea className="flex-1 h-0">
-                      <Table>
-                        <TableHeader className="bg-neutral-950/90 sticky top-0 backdrop-blur-md z-10 border-b border-neutral-800">
-                          <TableRow className="border-neutral-800 hover:bg-transparent">
-                            <TableHead className="w-[100px] text-neutral-300">Type</TableHead>
-                            <TableHead className="text-neutral-300">Content</TableHead>
-                            <TableHead className="text-neutral-300">Selector (CSS)</TableHead>
-                            <TableHead className="text-right text-neutral-300">Attributes</TableHead>
-                          </TableRow>
-                        </TableHeader>
-                        <TableBody>
-                          <AnimatePresence mode='popLayout'>
-                            {elements.map((el, i) => (
-                              <motion.tr
-                                key={`${i}-${el.selectors.css}`}
-                                initial={{ opacity: 0, y: 10 }}
-                                animate={{ opacity: 1, y: 0 }}
-                                transition={{ delay: i * 0.05, duration: 0.3 }}
-                                className="border-neutral-800 hover:bg-neutral-800/40 transition-colors group"
-                                style={{ display: 'table-row' }} // Essential for table layout
-                              >
-                                <TableCell>
-                                  <Badge variant="outline" className={`
-                                    ${el.type === 'BUTTON' ? 'border-indigo-500/50 text-indigo-400 bg-indigo-500/10' :
-                                      el.type === 'LINK' ? 'border-cyan-500/50 text-cyan-400 bg-cyan-500/10' :
-                                        el.type === 'INPUT' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' :
-                                          'border-neutral-500 text-neutral-400'}
-                                      backdrop-blur-sm
-                                    `}>
-                                    {el.type}
-                                  </Badge>
-                                </TableCell>
-                                <TableCell className="max-w-[200px]" title={el.content.text || el.content.placeholder || ""}>
-                                  <div className="truncate font-medium text-neutral-200">{el.content.text}</div>
-                                  {el.content.placeholder && <div className="text-neutral-500 text-xs truncate">Ph: {el.content.placeholder}</div>}
-                                </TableCell>
-                                <TableCell className="font-mono text-xs text-neutral-500 max-w-[200px]">
-                                  <div className="truncate text-indigo-300/60 group-hover:text-indigo-300 transition-colors cursor-help" title={el.selectors.css}>{el.selectors.css}</div>
-                                </TableCell>
-                                <TableCell className="text-right text-xs text-neutral-400">
-                                  {el.attributes.href && <div className="truncate max-w-[150px] ml-auto text-cyan-600/70 group-hover:text-cyan-400" title={el.attributes.href}>href: {el.attributes.href}</div>}
-                                  {el.attributes.src && <div className="truncate max-w-[150px] ml-auto">src: {el.attributes.src}</div>}
-                                </TableCell>
-                              </motion.tr>
-                            ))}
-                          </AnimatePresence>
-                          {elements.length === 0 && (
-                            <TableRow>
-                              <TableCell colSpan={4} className="h-32 text-center text-neutral-500">
-                                <motion.div
-                                  initial={{ opacity: 0 }}
-                                  animate={{ opacity: 1 }}
-                                  className="flex flex-col items-center gap-2"
-                                >
-                                  <Layers className="w-8 h-8 opacity-20" />
-                                  <span>No elements extracted. Enter a URL and start extraction.</span>
-                                </motion.div>
-                              </TableCell>
-                            </TableRow>
-                          )}
-                        </TableBody>
-                      </Table>
+                      <div className="w-full inline-block align-middle">
+                        <div className="border rounded-md">
+                          <table className="w-full text-sm caption-bottom">
+                            <TableHeader className="bg-neutral-950/90 sticky top-0 backdrop-blur-md z-10 border-b border-neutral-800">
+                              <TableRow className="border-neutral-800 hover:bg-transparent">
+                                <TableHead className="w-[100px] text-neutral-300">Type</TableHead>
+                                <TableHead className="text-neutral-300">Content</TableHead>
+                                <TableHead className="text-neutral-300">AI Context</TableHead>
+                                <TableHead className="text-neutral-300">Selector (CSS)</TableHead>
+                                <TableHead className="text-right text-neutral-300">Attributes / Action</TableHead>
+                              </TableRow>
+                            </TableHeader>
+                            <TableBody>
+                              <AnimatePresence mode='popLayout'>
+                                {elements.map((el, i) => (
+                                  <motion.tr
+                                    key={`${i}-${el.selectors.css}`}
+                                    initial={{ opacity: 0, y: 10 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    transition={{ delay: i * 0.05, duration: 0.3 }}
+                                    className="border-neutral-800 hover:bg-neutral-800/40 transition-colors group border-b"
+                                    style={{ display: 'table-row' }} // Essential for table layout
+                                  >
+                                    <TableCell>
+                                      <Badge variant="outline" className={`
+                                        ${el.type === 'BUTTON' ? 'border-indigo-500/50 text-indigo-400 bg-indigo-500/10' :
+                                          el.type === 'LINK' ? 'border-cyan-500/50 text-cyan-400 bg-cyan-500/10' :
+                                            el.type === 'INPUT' ? 'border-amber-500/50 text-amber-400 bg-amber-500/10' :
+                                              'border-neutral-500 text-neutral-400'}
+                                          backdrop-blur-sm
+                                        `}>
+                                        {el.type}
+                                      </Badge>
+                                    </TableCell>
+                                    <TableCell className="max-w-[200px]" title={el.content.text || el.content.placeholder || ""}>
+                                      <div className="truncate font-medium text-neutral-200">{el.content.text}</div>
+                                      {el.content.placeholder && <div className="text-neutral-500 text-xs truncate">Ph: {el.content.placeholder}</div>}
+                                    </TableCell>
+                                    <TableCell className="max-w-[250px]">
+                                      {el.llm_context ? (
+                                        <div className="text-xs text-emerald-400/90 font-medium leading-tight">
+                                          <Sparkles className="w-3 h-3 inline mr-1 text-emerald-500" />
+                                          {el.llm_context}
+                                        </div>
+                                      ) : (
+                                        <div className="text-xs text-neutral-600 italic">Not analyzed</div>
+                                      )}
+                                    </TableCell>
+                                    <TableCell className="font-mono text-xs text-neutral-500 max-w-[200px]">
+                                      <div className="truncate text-indigo-300/60 group-hover:text-indigo-300 transition-colors cursor-help" title={el.selectors.css}>{el.selectors.css}</div>
+                                    </TableCell>
+                                    <TableCell className="text-right text-xs text-neutral-400 px-4">
+                                      <div className="flex flex-col items-end gap-1">
+                                        {el.attributes.href && <div className="truncate max-w-[150px] text-cyan-600/70 group-hover:text-cyan-400" title={el.attributes.href}>href: {el.attributes.href}</div>}
+                                        {el.attributes.src && <div className="truncate max-w-[150px]">src: {el.attributes.src}</div>}
+
+                                        <ElementAction el={el} onInteract={handleInteraction} isInteracting={isInteracting} />
+                                      </div>
+                                    </TableCell>
+                                  </motion.tr>
+                                ))}
+                              </AnimatePresence>
+                              {elements.length === 0 && (
+                                <TableRow>
+                                  <TableCell colSpan={5} className="h-32 text-center text-neutral-500">
+                                    <motion.div
+                                      initial={{ opacity: 0 }}
+                                      animate={{ opacity: 1 }}
+                                      className="flex flex-col items-center gap-2"
+                                    >
+                                      <Layers className="w-8 h-8 opacity-20" />
+                                      <span>No elements extracted. Enter a URL and start extraction.</span>
+                                    </motion.div>
+                                  </TableCell>
+                                </TableRow>
+                              )}
+                            </TableBody>
+                          </table>
+                        </div>
+                      </div>
                     </ScrollArea>
                   </TabsContent>
 
@@ -355,7 +543,7 @@ export default function Home() {
                         animate={{ opacity: 1 }}
                         transition={{ duration: 0.5 }}
                       >
-                        {JSON.stringify({ meta: { source_url: url }, elements }, null, 2)}
+                        {JSON.stringify({ meta: meta || { source_url: url }, elements }, null, 2)}
                       </motion.pre>
                     </ScrollArea>
                   </TabsContent>
