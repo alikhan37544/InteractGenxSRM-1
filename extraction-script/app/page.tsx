@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -9,9 +9,11 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Badge } from "@/components/ui/badge";
-import { Play, Sparkles, Download, FileJson, X, Globe, Terminal, Loader2, MousePointer2, Brain, Code, Layers } from "lucide-react";
+import { Play, Sparkles, Download, FileJson, X, Globe, Terminal, Loader2, MousePointer2, Brain, Code, Layers, History } from "lucide-react";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { motion, AnimatePresence } from "framer-motion";
+import { CachePopup } from "@/components/CachePopup";
+import { HistoryPanel } from "@/components/HistoryPanel";
 
 interface ExtractedElement {
   type: string;
@@ -38,6 +40,28 @@ interface LogEntry {
   timestamp: string;
   message: string;
   type: 'info' | 'success' | 'error';
+}
+
+interface CacheData {
+  url: string;
+  title: string;
+  lastScrapedAt: string;
+  aiEnrichmentStatus: 'none' | 'partial' | 'full';
+  elementCount: number;
+  enrichedElementCount: number;
+  scrapeCount: number;
+}
+
+interface PageMeta {
+  source_url: string;
+  cached?: boolean;
+  timestamp?: string;
+  title?: string;
+  aiEnrichmentStatus?: 'none' | 'partial' | 'full';
+  enrichedCount?: number;
+  totalElements?: number;
+  firstScrapedAt?: string;
+  scrapeCount?: number;
 }
 
 const ElementAction = ({ el, onInteract, isInteracting }: { el: ExtractedElement, onInteract: any, isInteracting: boolean }) => {
@@ -94,37 +118,87 @@ const ElementAction = ({ el, onInteract, isInteracting }: { el: ExtractedElement
 
 export default function Home() {
   const [url, setUrl] = useState("");
-  const [isHeadless, setIsHeadless] = useState(false); // Default to false (headed) for interactive mode visibility
+  const [isHeadless, setIsHeadless] = useState(false);
   const [forceRefresh, setForceRefresh] = useState(false);
   const [isExtracting, setIsExtracting] = useState(false);
   const [isInteracting, setIsInteracting] = useState(false);
   const [isEnriching, setIsEnriching] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [elements, setElements] = useState<ExtractedElement[]>([]);
-  const [meta, setMeta] = useState<any>(null);
+  const [meta, setMeta] = useState<PageMeta | null>(null);
   const [activeTab, setActiveTab] = useState("table");
+  
+  // New state for history and cache popup
+  const [isHistoryOpen, setIsHistoryOpen] = useState(false);
+  const [showCachePopup, setShowCachePopup] = useState(false);
+  const [cacheData, setCacheData] = useState<CacheData | null>(null);
+  const [isCheckingCache, setIsCheckingCache] = useState(false);
 
   const addLog = (message: string, type: 'info' | 'success' | 'error' = 'info') => {
     setLogs(prev => [...prev, { timestamp: new Date().toLocaleTimeString(), message, type }]);
   };
 
-  const handleExtract = async () => {
-    if (!url) {
+  // Check if URL is already cached
+  const checkCacheStatus = useCallback(async (targetUrl: string) => {
+    if (!targetUrl) return;
+    
+    setIsCheckingCache(true);
+    try {
+      const response = await fetch(`/api/history/check?url=${encodeURIComponent(targetUrl)}`);
+      const data = await response.json();
+      
+      if (data.success && data.data.exists) {
+        setCacheData({
+          url: data.data.url,
+          title: data.data.title,
+          lastScrapedAt: data.data.lastScrapedAt,
+          aiEnrichmentStatus: data.data.aiEnrichmentStatus,
+          elementCount: data.data.elementCount,
+          enrichedElementCount: data.data.enrichedElementCount,
+          scrapeCount: data.data.scrapeCount
+        });
+        setShowCachePopup(true);
+      } else {
+        setCacheData(null);
+        setShowCachePopup(false);
+      }
+    } catch (error) {
+      console.error("Cache check error:", error);
+    } finally {
+      setIsCheckingCache(false);
+    }
+  }, []);
+
+  // Check cache when URL changes (with debounce)
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (url && !forceRefresh) {
+        checkCacheStatus(url);
+      }
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [url, forceRefresh, checkCacheStatus]);
+
+  const handleExtract = async (overrideUrl?: string) => {
+    const targetUrl = overrideUrl || url;
+    
+    if (!targetUrl) {
       addLog("Please enter a valid URL", "error");
       return;
     }
 
     setIsExtracting(true);
-    setLogs([]); // Keep old logs? Maybe clear for new session.
+    setLogs([]);
     setElements([]);
     setMeta(null);
-    addLog(`Starting session for ${url} (Force Refresh: ${forceRefresh})...`);
+    setShowCachePopup(false);
+    addLog(`Starting session for ${targetUrl} (Force Refresh: ${forceRefresh})...`);
 
     try {
       const response = await fetch("/api/session/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, headless: isHeadless, forceRefresh }),
+        body: JSON.stringify({ url: targetUrl, headless: isHeadless, forceRefresh }),
       });
 
       if (!response.ok) {
@@ -136,11 +210,22 @@ export default function Home() {
 
       setElements(data.elements);
       setMeta(data.meta);
+      setUrl(targetUrl); // Ensure URL state is synced
       const source = data.meta.cached ? "Database Cache" : "Live Browser";
       addLog(`Session started. Loaded ${data.elements.length} elements from ${source}.`, "success");
+      
+      if (data.meta.aiEnrichmentStatus) {
+        const statusText = data.meta.aiEnrichmentStatus === 'full' 
+          ? 'Fully analyzed' 
+          : data.meta.aiEnrichmentStatus === 'partial' 
+            ? 'Partially analyzed' 
+            : 'Not analyzed';
+        addLog(`AI Status: ${statusText} (${data.meta.enrichedCount}/${data.meta.totalElements})`, "info");
+      }
 
-    } catch (error: any) {
-      addLog(`Session failed: ${error.message}`, "error");
+    } catch (error) {
+      const err = error as Error;
+      addLog(`Session failed: ${err.message}`, "error");
     } finally {
       setIsExtracting(false);
     }
@@ -153,7 +238,7 @@ export default function Home() {
       const response = await fetch("/api/session/interact", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ selector, action, value, url }), // Send URL for session recovery
+        body: JSON.stringify({ selector, action, value, url }),
       });
 
       if (!response.ok) {
@@ -163,10 +248,11 @@ export default function Home() {
 
       const data = await response.json();
       setElements(data.elements);
-      setMeta({ ...meta, source_url: data.meta.source_url }); // Update URL if changed
+      setMeta(prev => prev ? { ...prev, source_url: data.meta.source_url } : null);
       addLog(`Interaction complete. URL is now: ${data.meta.source_url}`, "success");
-    } catch (error: any) {
-      addLog(`Interaction error: ${error.message}`, "error");
+    } catch (error) {
+      const err = error as Error;
+      addLog(`Interaction error: ${err.message}`, "error");
     } finally {
       setIsInteracting(false);
     }
@@ -195,13 +281,40 @@ export default function Home() {
 
       const data = await response.json();
       setElements(data.elements);
-      addLog(`Enrichment complete. Context added to elements.`, "success");
+      
+      // Update meta with new enrichment status
+      setMeta(prev => prev ? {
+        ...prev, 
+        aiEnrichmentStatus: data.meta.aiEnrichmentStatus,
+        enrichedCount: data.meta.enrichedCount,
+        totalElements: data.meta.totalElements
+      } : null);
+      
+      addLog(`Enrichment complete. ${data.meta.enrichedCount}/${data.meta.totalElements} elements analyzed.`, "success");
 
-    } catch (error: any) {
-      addLog(`Enrichment error: ${error.message}`, "error");
+    } catch (error) {
+      const err = error as Error;
+      addLog(`Enrichment error: ${err.message}`, "error");
     } finally {
       setIsEnriching(false);
     }
+  };
+
+  // Handle selecting a page from history
+  const handleSelectFromHistory = (selectedUrl: string) => {
+    setIsHistoryOpen(false);
+    // Pass URL directly to avoid race condition with state
+    handleExtract(selectedUrl);
+  };
+
+  // Handle force refresh from popup
+  const handleForceRefresh = () => {
+    const currentUrl = url;
+    setForceRefresh(true);
+    setShowCachePopup(false);
+    // Use the current URL directly
+    handleExtract(currentUrl);
+    setForceRefresh(false);
   };
 
   const downloadJson = () => {
@@ -246,12 +359,24 @@ export default function Home() {
             </h1>
             <p className="text-neutral-400 font-light">Automated content extraction & schema mapping engine</p>
           </div>
-          <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
-            <Button variant="outline" className="border-neutral-700 hover:bg-neutral-800 hover:text-indigo-400 transition-colors" onClick={() => window.open('https://github.com', '_blank')}>
-              <Code className="w-4 h-4 mr-2" />
-              Documentation
-            </Button>
-          </motion.div>
+          <div className="flex items-center gap-3">
+            <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+              <Button 
+                variant="outline" 
+                className="border-neutral-700 bg-neutral-800/50 text-white hover:bg-indigo-600 hover:border-indigo-500 hover:text-white transition-colors"
+                onClick={() => setIsHistoryOpen(true)}
+              >
+                <History className="w-4 h-4 mr-2" />
+                History
+              </Button>
+            </motion.div>
+            <motion.div whileHover={{ scale: 1.05 }} whileTap={{ scale: 0.95 }}>
+              <Button variant="outline" className="border-neutral-700 bg-neutral-800/50 text-white hover:bg-neutral-700 hover:border-neutral-600 transition-colors" onClick={() => window.open('https://github.com', '_blank')}>
+                <Code className="w-4 h-4 mr-2" />
+                Documentation
+              </Button>
+            </motion.div>
+          </div>
         </motion.header>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -307,7 +432,7 @@ export default function Home() {
                     <Button
                       className="w-full bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-900/20 font-semibold tracking-wide"
                       size="lg"
-                      onClick={handleExtract}
+                      onClick={() => handleExtract()}
                       disabled={isExtracting}
                     >
                       {isExtracting ? (
@@ -553,6 +678,25 @@ export default function Home() {
           </motion.div>
         </div>
       </motion.div>
+
+      {/* Cache Popup */}
+      <CachePopup
+        isVisible={showCachePopup}
+        data={cacheData}
+        onDismiss={() => setShowCachePopup(false)}
+        onForceRefresh={handleForceRefresh}
+        onViewHistory={() => {
+          setShowCachePopup(false);
+          setIsHistoryOpen(true);
+        }}
+      />
+
+      {/* History Panel */}
+      <HistoryPanel
+        isOpen={isHistoryOpen}
+        onClose={() => setIsHistoryOpen(false)}
+        onSelectPage={handleSelectFromHistory}
+      />
     </div>
   );
 }

@@ -32,13 +32,20 @@ async function ensureSchema() {
         // Now ensure tables exist within the pool's DB
         // We can use the pool now that DB exists (or should)
 
-        // Table: scraped_pages
+        // Table: scraped_pages - Enhanced with AI enrichment tracking
         await pool.query(`
           CREATE TABLE IF NOT EXISTS scraped_pages (
             url VARCHAR(768) PRIMARY KEY,
             full_url TEXT,
             title VARCHAR(512),
-            last_scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            last_scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            ai_enrichment_status ENUM('none', 'partial', 'full') DEFAULT 'none',
+            enriched_at TIMESTAMP NULL,
+            element_count INT DEFAULT 0,
+            enriched_element_count INT DEFAULT 0,
+            first_scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            scrape_count INT DEFAULT 1,
+            notes TEXT
           )
         `);
 
@@ -53,34 +60,101 @@ async function ensureSchema() {
             attributes JSON,
             geometry JSON,
             llm_context TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (page_url) REFERENCES scraped_pages(url) ON DELETE CASCADE
           )
         `);
 
-        // Table: context
+        // Table: context - Persistent AI context storage
         await pool.query(`
           CREATE TABLE IF NOT EXISTS context (
             id INT AUTO_INCREMENT PRIMARY KEY,
             name VARCHAR(255),
             data JSON,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
           )
         `);
 
-        // Ensure llm_context column exists (for migration safety if table existed but column didn't)
-        try {
-            await pool.query(`ALTER TABLE elements ADD COLUMN llm_context TEXT`);
-        } catch (e: any) {
-            if (e.code !== 'ER_DUP_FIELDNAME') {
-                // Ignore duplicate column error, rethrow others
-                if (!e.message.includes("Duplicate column name")) {
-                    // console.error("Column add warning:", e.message); 
+        // Table: scraping_history - Track all scraping events
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS scraping_history (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            page_url VARCHAR(768),
+            action VARCHAR(50) NOT NULL,
+            element_count INT DEFAULT 0,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (page_url) REFERENCES scraped_pages(url) ON DELETE CASCADE
+          )
+        `);
+
+        // Table: ai_analysis_log - Track AI enrichment runs
+        await pool.query(`
+          CREATE TABLE IF NOT EXISTS ai_analysis_log (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            page_url VARCHAR(768),
+            elements_processed INT DEFAULT 0,
+            elements_enriched INT DEFAULT 0,
+            model_used VARCHAR(100),
+            success BOOLEAN DEFAULT true,
+            error_message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (page_url) REFERENCES scraped_pages(url) ON DELETE CASCADE
+          )
+        `);
+
+        // Migration: Add new columns to scraped_pages if they don't exist
+        const columnsToAdd = [
+            { name: 'ai_enrichment_status', def: "ENUM('none', 'partial', 'full') DEFAULT 'none'" },
+            { name: 'enriched_at', def: 'TIMESTAMP NULL' },
+            { name: 'element_count', def: 'INT DEFAULT 0' },
+            { name: 'enriched_element_count', def: 'INT DEFAULT 0' },
+            { name: 'first_scraped_at', def: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
+            { name: 'scrape_count', def: 'INT DEFAULT 1' },
+            { name: 'notes', def: 'TEXT' }
+        ];
+
+        for (const col of columnsToAdd) {
+            try {
+                await pool.query(`ALTER TABLE scraped_pages ADD COLUMN ${col.name} ${col.def}`);
+            } catch (e: any) {
+                // Ignore duplicate column errors
+                if (!e.message.includes("Duplicate column name") && e.code !== 'ER_DUP_FIELDNAME') {
+                    console.error(`Column add warning for ${col.name}:`, e.message);
                 }
             }
         }
 
+        // Ensure llm_context column exists in elements (for migration safety)
+        try {
+            await pool.query(`ALTER TABLE elements ADD COLUMN llm_context TEXT`);
+        } catch (e: any) {
+            if (!e.message.includes("Duplicate column name") && e.code !== 'ER_DUP_FIELDNAME') {
+                console.error("Column add warning:", e.message);
+            }
+        }
+
+        // Ensure created_at column exists in elements
+        try {
+            await pool.query(`ALTER TABLE elements ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP`);
+        } catch (e: any) {
+            if (!e.message.includes("Duplicate column name") && e.code !== 'ER_DUP_FIELDNAME') {
+                console.error("Column add warning:", e.message);
+            }
+        }
+
+        // Ensure updated_at column exists in context
+        try {
+            await pool.query(`ALTER TABLE context ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`);
+        } catch (e: any) {
+            if (!e.message.includes("Duplicate column name") && e.code !== 'ER_DUP_FIELDNAME') {
+                // Ignore
+            }
+        }
+
         schemaChecked = true;
-        console.log("Database schema verified.");
+        console.log("Database schema verified and migrated.");
 
     } catch (error) {
         console.error("Schema initialization failed:", error);

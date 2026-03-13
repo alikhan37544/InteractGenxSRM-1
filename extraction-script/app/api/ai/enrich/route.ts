@@ -20,7 +20,7 @@ export async function POST(req: Request) {
         const parsedElements = elements.map(el => ({
             ...el,
             content: typeof el.content === 'string' ? JSON.parse(el.content) : el.content,
-            Selectors: typeof el.selectors === 'string' ? JSON.parse(el.selectors) : el.selectors, // Note: DB column is lowercase 'selectors' but check if casing matters in map
+            Selectors: typeof el.selectors === 'string' ? JSON.parse(el.selectors) : el.selectors,
             selectors: typeof el.selectors === 'string' ? JSON.parse(el.selectors) : el.selectors,
             attributes: typeof el.attributes === 'string' ? JSON.parse(el.attributes) : el.attributes,
             geometry: typeof el.geometry === 'string' ? JSON.parse(el.geometry) : el.geometry,
@@ -31,12 +31,6 @@ export async function POST(req: Request) {
         }
 
         // 2. Get Simplified HTML
-        // Ensure browser is at the URL (it should be if session is active, otherwise navigate)
-        // For this prototype, we assume the user is staring at the page in the "interactive session".
-        // If not, we might need to navigate.
-        // Let's check current URL match just in case.
-        // actually getSimplifiedHtml throws if not init. 
-        // We'll trust the user flow: Extract -> Enrich.
         const html = await browserManager.getSimplifiedHtml();
 
         // 3. Call LLM
@@ -50,10 +44,6 @@ export async function POST(req: Request) {
         for (const [key, context] of Object.entries(enrichmentMap)) {
             if (!context) continue;
             const val = context as string;
-
-            // Find element by identifying property
-            // We sent { id, selector } to LLM.
-            // LLM might return ID, Selector, or a slightly modified selector.
 
             let el = parsedElements.find(e => e.selectors.css === key || e.selectors.id === key);
 
@@ -82,7 +72,25 @@ export async function POST(req: Request) {
 
         console.log(`Enriched ${updateCount} elements.`);
 
-        // 5. Return updated elements
+        // 5. Update page enrichment status
+        const totalElements = parsedElements.length;
+        const enrichmentStatus = updateCount >= totalElements ? 'full' : (updateCount > 0 ? 'partial' : 'none');
+        
+        await query(`
+            UPDATE scraped_pages 
+            SET ai_enrichment_status = ?, 
+                enriched_at = CURRENT_TIMESTAMP,
+                enriched_element_count = ?
+            WHERE url = ?
+        `, [enrichmentStatus, updateCount, url]);
+
+        // 6. Log the AI analysis
+        await query(`
+            INSERT INTO ai_analysis_log (page_url, elements_processed, elements_enriched, model_used, success)
+            VALUES (?, ?, ?, ?, ?)
+        `, [url, parsedElements.length, updateCount, 'google/gemma-3-1b-it', true]);
+
+        // 7. Return updated elements
         const updatedElements = await query('SELECT * FROM elements WHERE page_url = ?', [url]);
         const finalElements = (updatedElements as any[]).map(el => ({
             ...el,
@@ -93,12 +101,32 @@ export async function POST(req: Request) {
         }));
 
         return NextResponse.json({
-            meta: { source_url: url, enriched: true },
+            meta: { 
+                source_url: url, 
+                enriched: true,
+                aiEnrichmentStatus: enrichmentStatus,
+                enrichedCount: updateCount,
+                totalElements
+            },
             elements: finalElements
         });
 
     } catch (error: any) {
         console.error("Enrichment error:", error);
+        
+        // Log failed attempt
+        try {
+            const { url } = await req.json();
+            if (url) {
+                await query(`
+                    INSERT INTO ai_analysis_log (page_url, elements_processed, elements_enriched, model_used, success, error_message)
+                    VALUES (?, 0, 0, 'google/gemma-3-1b-it', false, ?)
+                `, [url, error.message || 'Unknown error']);
+            }
+        } catch (logError) {
+            console.error("Failed to log error:", logError);
+        }
+        
         return NextResponse.json({ error: error.message || "Failed to enrich" }, { status: 500 });
     }
 }
