@@ -2,8 +2,6 @@
 // Executes instructions using browser automation and database
 
 import OpenAI from 'openai';
-import browserManager from '@/lib/browser';
-import { query } from '@/lib/db';
 import { AgentInstruction, PageElement } from '@/shared/types';
 import { ContextAnalysis, ExecutionResult } from './types';
 import { ContextManager } from './context-manager';
@@ -13,17 +11,40 @@ const openai = new OpenAI({
     apiKey: 'lm-studio',
 });
 
+// Dynamic import for extraction-script modules
+let query: any;
+let browserManager: any;
+
+async function initExtractionScript() {
+    if (!query) {
+        const dbModule = await import('@/lib/db');
+        query = dbModule.query;
+    }
+    if (!browserManager) {
+        const browserModule = await import('@/lib/browser');
+        browserManager = browserModule.default;
+    }
+}
+
 export class ActionExecutor {
     private contextManager: ContextManager;
     private model: string;
     private temperature: number;
     private maxRetries: number;
+    private initialized = false;
 
     constructor(model: string = 'google/gemma-3-1b-it', temperature: number = 0.2, maxRetries: number = 2) {
         this.contextManager = new ContextManager();
         this.model = model;
         this.temperature = temperature;
         this.maxRetries = maxRetries;
+    }
+
+    private async ensureInitialized() {
+        if (!this.initialized) {
+            await initExtractionScript();
+            this.initialized = true;
+        }
     }
 
     /**
@@ -33,6 +54,8 @@ export class ActionExecutor {
         instruction: AgentInstruction,
         contextAnalysis: ContextAnalysis
     ): Promise<ExecutionResult> {
+        await this.ensureInitialized();
+
         let attempts = 0;
         let lastError: Error | null = null;
 
@@ -338,14 +361,24 @@ Return only the best CSS selector as a JSON string: {"selector": "..."}`;
                     { role: 'system', content: 'You are a CSS selector expert. Return only valid JSON with a selector field.' },
                     { role: 'user', content: prompt }
                 ],
-                temperature: this.temperature,
-                response_format: { type: 'json_object' }
+                temperature: this.temperature
             });
 
             const content = completion.choices[0].message.content;
             if (content) {
-                const parsed = JSON.parse(content);
-                return parsed.selector || null;
+                try {
+                    // Remove markdown code blocks if present
+                    const cleanedContent = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+                    const parsed = JSON.parse(cleanedContent);
+                    return parsed.selector || null;
+                } catch (parseError) {
+                    // Try to extract JSON from the response
+                    const jsonMatch = content.match(/\{[\s\S]*\}/);
+                    if (jsonMatch) {
+                        const parsed = JSON.parse(jsonMatch[0]);
+                        return parsed.selector || null;
+                    }
+                }
             }
 
         } catch (error) {
@@ -355,4 +388,3 @@ Return only the best CSS selector as a JSON string: {"selector": "..."}`;
         return null;
     }
 }
-

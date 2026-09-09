@@ -74,8 +74,7 @@ Generate clear, actionable instructions for the secondary agent to execute this 
                     { role: 'system', content: systemPrompt },
                     { role: 'user', content: userPrompt }
                 ],
-                temperature: this.temperature,
-                response_format: { type: 'json_object' }
+                temperature: this.temperature
             });
 
             const content = completion.choices[0].message.content;
@@ -83,7 +82,21 @@ Generate clear, actionable instructions for the secondary agent to execute this 
                 throw new Error('No response from LLM');
             }
 
-            const parsed = JSON.parse(content);
+            // Try to parse JSON - handle cases where response might be wrapped in markdown code blocks
+            let parsed;
+            try {
+                // Remove markdown code blocks if present
+                const cleanedContent = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
+                parsed = JSON.parse(cleanedContent);
+            } catch (parseError) {
+                // If JSON parsing fails, try to extract JSON from the response
+                const jsonMatch = content.match(/\{[\s\S]*\}/);
+                if (jsonMatch) {
+                    parsed = JSON.parse(jsonMatch[0]);
+                } else {
+                    throw new Error(`Failed to parse JSON response: ${parseError}`);
+                }
+            }
             
             // Generate unique IDs for instructions
             const instructions: AgentInstruction[] = (parsed.instructions || []).map((inst: any, index: number) => ({

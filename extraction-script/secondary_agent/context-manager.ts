@@ -1,19 +1,53 @@
 // Secondary Agent: Context Manager
 // Understands database structure, current page context, and available elements
 
-// Note: When used in extraction-script, these imports resolve via @/ aliases
-// Root-level agents use relative paths that need to be adjusted when copied to extraction-script
-import { query } from '@/lib/db';
 import { AgentContext, DBSchemaInfo, PageElement } from '@/shared/types';
 import { ContextAnalysis } from './types';
-import browserManager from '@/lib/browser';
+
+// Dynamic imports for extraction-script modules
+let query: any;
+let browserManager: any;
+
+// Initialize extraction-script dependencies
+async function initExtractionScript() {
+    if (!query) {
+        const dbModule = await import('@/lib/db');
+        query = dbModule.query;
+    }
+    if (!browserManager) {
+        const browserModule = await import('@/lib/browser');
+        browserManager = browserModule.default;
+    }
+}
 
 export class ContextManager {
+    private initialized = false;
+
+    private async ensureInitialized() {
+        if (!this.initialized) {
+            await initExtractionScript();
+            this.initialized = true;
+        }
+    }
+
     /**
      * Get current page context from browser and database
      */
     async getCurrentContext(): Promise<AgentContext> {
+        await this.ensureInitialized();
+
         try {
+            // Initialize browser if not already initialized
+            // The browser manager's init method checks if already initialized
+            if (browserManager && typeof browserManager.init === 'function') {
+                try {
+                    await browserManager.init(false); // Use non-headless mode (false = visible browser)
+                } catch (error) {
+                    // Browser might already be initialized or init failed
+                    console.warn('Browser initialization attempt:', error);
+                }
+            }
+
             // Get current page state from browser
             const pageContent = await browserManager.getPageContent();
             
@@ -72,6 +106,7 @@ export class ContextManager {
         }
 
         // Get element count from DB
+        await this.ensureInitialized();
         const dbElementCount = await query(
             'SELECT COUNT(*) as count FROM elements WHERE page_url = ?',
             [context.currentUrl]
@@ -91,6 +126,8 @@ export class ContextManager {
      * Get database schema information
      */
     private async getDBSchemaInfo(): Promise<DBSchemaInfo> {
+        await this.ensureInitialized();
+
         try {
             // Get table structures
             const tables = {
@@ -138,6 +175,8 @@ export class ContextManager {
      * Get elements for a specific page from database
      */
     private async getPageElementsFromDB(url: string): Promise<PageElement[]> {
+        await this.ensureInitialized();
+
         try {
             const results = await query(
                 'SELECT type, content, selectors, attributes, geometry FROM elements WHERE page_url = ?',
@@ -168,6 +207,8 @@ export class ContextManager {
      * Update context in database
      */
     async updateContext(name: string, data: any): Promise<void> {
+        await this.ensureInitialized();
+
         try {
             await query(
                 'INSERT INTO context (name, data) VALUES (?, ?)',
@@ -179,4 +220,3 @@ export class ContextManager {
         }
     }
 }
-
