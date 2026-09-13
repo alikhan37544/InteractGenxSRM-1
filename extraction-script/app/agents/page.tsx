@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
@@ -9,7 +9,7 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Send, Loader2, CheckCircle2, XCircle, Info, Settings, Play, Brain, Sparkles } from "lucide-react";
+import { Send, Loader2, CheckCircle2, XCircle, Info, Settings, Play, Brain, Sparkles, RefreshCw, Cpu } from "lucide-react";
 import LiveStreamPanel, { emptyStreamState, StreamState } from "@/components/LiveStreamPanel";
 import LiveActivityPanel from "@/components/LiveActivityPanel";
 import type { StreamEvent } from "@/shared/streaming";
@@ -63,6 +63,64 @@ export default function AgentsPage() {
   const [primaryAgentUrl, setPrimaryAgentUrl] = useState("http://localhost:3001");
   const [history, setHistory] = useState<Array<{ input: string; response: AgentResponse; timestamp: Date }>>([]);
   const [stream, setStream] = useState<StreamState>(emptyStreamState());
+  const [models, setModels] = useState<string[]>([]);
+  const [defaultModel, setDefaultModel] = useState("");
+  const [selectedModel, setSelectedModel] = useState("");
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const modelsRequestId = useRef(0);
+
+  const loadModels = async (agentUrl: string) => {
+    const requestId = ++modelsRequestId.current;
+    setModelsLoading(true);
+    setModelsError(null);
+    try {
+      const res = await fetch(`${agentUrl}/models`);
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok || !payload.success) {
+        throw new Error(payload.error || `HTTP ${res.status}`);
+      }
+      if (requestId !== modelsRequestId.current) return; // stale response
+      const nextModels: string[] = payload.models || [];
+      setModels(nextModels);
+      setDefaultModel(payload.defaultModel || "");
+      // Drop a saved selection that no longer exists in LM Studio.
+      setSelectedModel((current) => {
+        if (current && !nextModels.includes(current)) {
+          if (typeof window !== "undefined") window.localStorage.removeItem("agent-model");
+          return "";
+        }
+        return current;
+      });
+    } catch (error: any) {
+      if (requestId !== modelsRequestId.current) return; // stale response
+      setModels([]);
+      setDefaultModel("");
+      setModelsError(error.message || "Failed to load models");
+    } finally {
+      if (requestId === modelsRequestId.current) setModelsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const saved = window.localStorage.getItem("agent-model");
+    if (saved) setSelectedModel(saved);
+  }, []);
+
+  useEffect(() => {
+    // Debounce so typing in the Agent URL field does not fire a request per keystroke.
+    const timer = setTimeout(() => loadModels(primaryAgentUrl), 500);
+    return () => clearTimeout(timer);
+  }, [primaryAgentUrl]);
+
+  const handleModelChange = (value: string) => {
+    setSelectedModel(value);
+    if (typeof window !== "undefined") {
+      if (value) window.localStorage.setItem("agent-model", value);
+      else window.localStorage.removeItem("agent-model");
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -132,6 +190,12 @@ export default function AgentsPage() {
         body: JSON.stringify({
           userInput: userInput.trim(),
           autoExecute,
+          ...((selectedModel || defaultModel)
+            ? {
+                config: { model: selectedModel || defaultModel },
+                secondaryConfig: { model: selectedModel || defaultModel },
+              }
+            : {}),
         }),
       });
 
@@ -250,6 +314,54 @@ export default function AgentsPage() {
                 placeholder="http://localhost:3001"
               />
             </div>
+            <div className="flex items-center gap-4">
+              <Label htmlFor="model" className="text-zinc-300 w-32 flex items-center gap-2">
+                <Cpu className="w-4 h-4" />
+                Model:
+              </Label>
+              <select
+                id="model"
+                value={selectedModel}
+                onChange={(e) => handleModelChange(e.target.value)}
+                disabled={modelsLoading}
+                className="flex-1 bg-zinc-700 border border-zinc-600 text-white rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+              >
+                <option value="">
+                  {modelsLoading
+                    ? "Loading models..."
+                    : defaultModel
+                      ? `Default (${defaultModel})`
+                      : "Default (server model)"}
+                </option>
+                {selectedModel && !models.includes(selectedModel) && (
+                  <option value={selectedModel}>{selectedModel} (not listed)</option>
+                )}
+                {models.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => loadModels(primaryAgentUrl)}
+                disabled={modelsLoading}
+                className="border-zinc-600 text-zinc-300 hover:bg-zinc-700"
+                title="Refresh model list from LM Studio"
+              >
+                <RefreshCw className={`w-4 h-4 ${modelsLoading ? "animate-spin" : ""}`} />
+              </Button>
+            </div>
+            {modelsError ? (
+              <p className="text-xs text-red-400 pl-36">
+                Could not list LM Studio models: {modelsError}
+              </p>
+            ) : models.length > 0 ? (
+              <p className="text-xs text-zinc-500 pl-36">
+                {models.length} model{models.length === 1 ? "" : "s"} available in LM Studio
+              </p>
+            ) : null}
             <div className="flex items-center gap-4">
               <Label htmlFor="auto-execute" className="text-zinc-300 flex-1">
                 Auto-execute instructions via Secondary Agent

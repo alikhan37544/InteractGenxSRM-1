@@ -28,6 +28,31 @@ export class SecondaryAgent {
     }
 
     /**
+     * Update the model configuration in place (recreates the action executor
+     * with the new model while keeping the context manager).
+     */
+    updateConfig(config?: Partial<SecondaryAgentConfig>): void {
+        this.config = {
+            model: config?.model ?? this.config.model,
+            temperature: config?.temperature ?? this.config.temperature,
+            maxRetries: config?.maxRetries ?? this.config.maxRetries
+        };
+
+        this.actionExecutor = new ActionExecutor(
+            this.config.model,
+            this.config.temperature,
+            this.config.maxRetries
+        );
+    }
+
+    /**
+     * Get a copy of the current configuration
+     */
+    getConfig(): SecondaryAgentConfig {
+        return { ...this.config };
+    }
+
+    /**
      * Execute a sequence of instructions
      */
     async executeInstructions(

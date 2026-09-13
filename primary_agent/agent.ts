@@ -40,6 +40,42 @@ export class PrimaryAgent {
     }
 
     /**
+     * Update the model configuration in place. Unlike replacing the instance
+     * (e.g. Object.assign with a new PrimaryAgent), this preserves the
+     * conversation history.
+     */
+    updateConfig(config?: Partial<PrimaryAgentConfig>): void {
+        this.config = {
+            model: config?.model ?? this.config.model,
+            temperature: config?.temperature ?? this.config.temperature,
+            maxInstructions: config?.maxInstructions ?? this.config.maxInstructions
+        };
+
+        this.intentRecognizer = new IntentRecognizer(
+            this.config.model,
+            this.config.temperature
+        );
+
+        this.instructionTranslator = new InstructionTranslator(
+            this.config.model,
+            this.config.temperature,
+            this.config.maxInstructions
+        );
+
+        this.responseSynthesizer = new ResponseSynthesizer(
+            this.config.model,
+            this.config.temperature
+        );
+    }
+
+    /**
+     * Get a copy of the current configuration
+     */
+    getConfig(): PrimaryAgentConfig {
+        return { ...this.config };
+    }
+
+    /**
      * Process user input and generate instructions for the secondary agent
      */
     async processUserInput(

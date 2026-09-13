@@ -30,15 +30,46 @@ for (const method of ACTIVITY_METHODS) {
 
 const app = express();
 const PORT = process.env.PORT || 3002;
+const LM_STUDIO_URL = process.env.LM_STUDIO_URL || 'http://localhost:1234/v1';
 
 app.use(cors());
 app.use(express.json());
 
 const agent = new SecondaryAgent();
+const DEFAULT_MODEL = agent.getConfig().model;
 
 // Health check
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', agent: 'secondary', port: PORT });
+});
+
+// List the models available in LM Studio
+app.get('/models', async (req, res) => {
+    try {
+        const response = await fetch(`${LM_STUDIO_URL}/models`, {
+            signal: AbortSignal.timeout(5000)
+        });
+        if (!response.ok) {
+            throw new Error(`LM Studio responded with HTTP ${response.status}`);
+        }
+        const payload: any = await response.json();
+        const models = (payload.data || [])
+            .map((m: any) => m.id)
+            .filter((id: any) => typeof id === 'string' && id.length > 0);
+        res.json({
+            success: true,
+            models,
+            defaultModel: DEFAULT_MODEL
+        });
+    } catch (error: any) {
+        console.error('Error listing LM Studio models:', error);
+        res.status(502).json({
+            success: false,
+            error: `Failed to list models from LM Studio: ${error.message}`,
+            models: [],
+            defaultModel: DEFAULT_MODEL
+        });
+    }
 });
 
 // Get current context
@@ -92,7 +123,7 @@ app.post('/execute', async (req, res) => {
 
         // Update agent config if provided
         if (config) {
-            Object.assign(agent, new SecondaryAgent(config));
+            agent.updateConfig(config);
         }
 
         const result = await agent.executeInstructions(instructions as AgentInstruction[]);
@@ -149,7 +180,7 @@ app.post('/execute/stream', async (req, res) => {
         }
 
         if (config) {
-            Object.assign(agent, new SecondaryAgent(config));
+            agent.updateConfig(config);
         }
 
         const result = await agent.executeInstructions(instructions as AgentInstruction[], hooks);

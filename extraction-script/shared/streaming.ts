@@ -49,6 +49,7 @@ const DEFAULT_EXPECTED_TOKENS: Record<StreamPhase, number> = {
     instruction_generation: 480,
     execution: 0,
     selector_resolution: 120,
+    response_synthesis: 260,
 };
 
 // Fallback generation rate (tokens/sec) used before any tokens have arrived.

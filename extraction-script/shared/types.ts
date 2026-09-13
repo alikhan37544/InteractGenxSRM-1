@@ -43,6 +43,9 @@ export interface PageElement {
         ariaLabel?: string | null;
         title?: string | null;
         className?: string | null;
+        tagName?: string | null;
+        inputType?: string | null;
+        disabled?: boolean;
     };
     geometry?: {
         x: number;

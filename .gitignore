@@ -13,5 +13,6 @@ __pycache__/
 !.env.example
 
 .DS_Store
+portal-*.png
 *.tsbuildinfo
 next-env.d.ts

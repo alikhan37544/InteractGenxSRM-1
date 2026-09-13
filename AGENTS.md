@@ -48,11 +48,20 @@ npm start    # Production mode
 
 **Endpoints:**
 - `GET /health` - Health check
+- `GET /models` - List the models available in LM Studio (`{success, models[], defaultModel}`)
 - `POST /process` - Process user input and generate instructions
 - `POST /process/stream` - Process user input with live SSE streaming + ETA
 - `GET /activity` - Live SSE stream of server console output (feeds the portal's **Live Server Activity** panel; relays the secondary agent's logs too)
 - `POST /clear-history` - Clear conversation history
 - `GET /history` - Get conversation history
+
+**Model selection:** both agents accept a per-request `config: { model, temperature, maxInstructions? }`.
+The primary applies it to itself and forwards `secondaryConfig` to the secondary as its `config`.
+The portal's Configuration card has a **Model** dropdown populated from `GET /models`
+(choice persisted in `localStorage`); it sends the selected model as both `config.model`
+and `secondaryConfig.model`. Config updates go through `PrimaryAgent.updateConfig()` /
+`SecondaryAgent.updateConfig()` — never `Object.assign(agent, new Agent(config))`, which
+would replace `conversationHistory` with a fresh empty array on every request.
 
 **Example Request (Generate Instructions Only):**
 ```bash
@@ -99,6 +108,7 @@ When `autoExecute: true`, the Primary Agent will:
 
 **Endpoints:**
 - `GET /health` - Health check
+- `GET /models` - List the models available in LM Studio
 - `GET /context` - Get current page context (URL, elements, etc.)
 - `POST /execute` - Execute a sequence of instructions
 - `POST /execute/stream` - Execute instructions with live SSE streaming
@@ -406,8 +416,36 @@ have a matching `.ts`/`.tsx`.
 
 Google blocks the automated browser. The instruction translator now prefers
 **DuckDuckGo** (`https://duckduckgo.com/`) for general web searches unless the
-user names a site. DDG's search needs an explicit click on its submit button —
-its box does not submit on Enter.
+user names a site. The prompt tells the model to target elements by
+**description** ("search box") instead of guessing CSS, and search fields submit
+on Enter automatically (`isSearchInput` accepts `input` and `textarea`).
+
+### `fill` / `click` time out on a guessed selector
+
+Symptom: `fill: input[name='q']` + `click: button[type='submit']` on
+duckduckgo.com both time out. Root causes and layered fixes:
+
+- DDG's search box is a `<textarea name="q">`, so `input[name='q']` matches
+  nothing. `fillElement` now falls back to `findEditableField()` — the best
+  visible, enabled, non-credential editable field (search-hinted fields first) —
+  and returns the selector it actually used.
+- DDG's submit button is disabled until the box has text, so the click that
+  follows a failed fill cannot succeed. `clickElement` now retries via
+  `clickEnabledMatch()` (first visible + enabled match, waiting up to 3s for a
+  disabled one to activate).
+- `findBestSelector` validates selector-like targets with
+  `countActionableMatches` (visible + enabled, not just present) and includes
+  `name` / `tagName` / `disabled` in its heuristics and the LLM resolver prompt.
+- `getPageContent` now extracts `attributes.name`, `tagName`, `inputType` and
+  `disabled` so resolution has the data it needs.
+
+### Conversation history resets when a model is selected
+
+`Object.assign(agent, new PrimaryAgent(config))` copies the new instance's
+`conversationHistory = []` over the singleton's history. Both servers must call
+`agent.updateConfig(config)` instead — in **all four** handlers
+(`/process`, `/process/stream`, `/execute`, `/execute/stream`). QA covers this
+via the streaming path (`I5 history preserved...`).
 
 ### Streaming endpoint sends nothing / only the first event
 

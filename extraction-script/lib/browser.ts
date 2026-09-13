@@ -52,25 +52,70 @@ class BrowserManager {
         try {
             await this.page.click(selector, { timeout: 5000 });
         } catch (e) {
-            // The element may be hidden behind a toggle (e.g. a collapsed menu).
-            // Try to reveal it by clicking a matching visible trigger, then retry.
-            console.warn(`Click failed for ${selector}; attempting to reveal hidden element...`);
-            const revealed = await this.tryReveal(selector);
-            if (!revealed) {
-                console.error(`Failed to click ${selector}:`, e);
-                throw e;
+            // A selector can match several elements where the first one is
+            // disabled (e.g. a submit button that activates after the search box
+            // is filled). Prefer an enabled match, waiting briefly in case the
+            // element is about to become enabled.
+            const enabledClicked = await this.clickEnabledMatch(selector).catch(() => false);
+            if (!enabledClicked) {
+                // The element may be hidden behind a toggle (e.g. a collapsed menu).
+                // Try to reveal it by clicking a matching visible trigger, then retry.
+                console.warn(`Click failed for ${selector}; attempting to reveal hidden element...`);
+                const revealed = await this.tryReveal(selector);
+                if (!revealed) {
+                    console.error(`Failed to click ${selector}:`, e);
+                    throw e;
+                }
+                await this.page.click(selector, { timeout: 5000 });
             }
-            await this.page.click(selector, { timeout: 5000 });
         }
 
         await this.page.waitForLoadState('domcontentloaded').catch(() => { }); // Catch if no nav happens
         await this.page.waitForTimeout(1000); // Wait for potential dynamic updates
     }
 
-    public async fillElement(selector: string, value: string) {
+    /**
+     * Click the first visible + enabled element matching the selector. Waits a
+     * short while for a disabled match to become enabled (common for search
+     * submit buttons that activate once their input has text).
+     */
+    private async clickEnabledMatch(selector: string): Promise<boolean> {
+        if (!this.page) return false;
+        const locator = this.page.locator(selector);
+        const deadline = Date.now() + 3000;
+        while (Date.now() < deadline) {
+            // Re-query each pass: the page may add/remove matches while we wait.
+            const count = await locator.count().catch(() => 0);
+            if (count === 0) return false;
+            for (let i = 0; i < count; i++) {
+                const candidate = locator.nth(i);
+                const visible = await candidate.isVisible().catch(() => false);
+                if (!visible) continue;
+                const enabled = await candidate.isEnabled().catch(() => false);
+                if (!enabled) continue;
+                try {
+                    await candidate.click({ timeout: 3000 });
+                    return true;
+                } catch {
+                    // Try the next match (overlay, animation, detached node, ...)
+                }
+            }
+            await this.page.waitForTimeout(300);
+        }
+        return false;
+    }
+
+    /**
+     * Fill an element and return the selector that was actually used. If the
+     * provided selector does not match (e.g. the model guessed
+     * `input[name='q']` but the site uses a textarea), falls back to the best
+     * visible editable field on the page.
+     */
+    public async fillElement(selector: string, value: string): Promise<string> {
         if (!this.page) throw new Error("Browser not initialized.");
         console.log(`Filling element: ${selector} with "${value}"`);
 
+        let usedSelector = selector;
         let filled = false;
         try {
             await this.page.fill(selector, value, { timeout: 5000 });
@@ -84,35 +129,133 @@ class BrowserManager {
                 try {
                     await this.page.fill(selector, value, { timeout: 5000 });
                     filled = true;
-                } catch { /* fall through to force fill */ }
+                } catch { /* fall through */ }
             }
-            if (!filled) {
+
+            // If the selector does match elements but they are not actionable
+            // (e.g. hidden behind an overlay), a force fill is the least
+            // surprising recovery and keeps the caller's intent.
+            if (!filled && await this.countMatches(selector) > 0) {
                 console.warn(`Retrying fill with force for ${selector}...`);
-                await this.page.fill(selector, value, { force: true, timeout: 5000 });
-                filled = true;
+                try {
+                    await this.page.fill(selector, value, { force: true, timeout: 5000 });
+                    filled = true;
+                } catch { /* fall through to the editable-field fallback */ }
+            }
+
+            // Otherwise the selector matches nothing at all (wrong tag or a
+            // guessed attribute). Fall back to the best visible editable field,
+            // which is what the user almost always means.
+            if (!filled) {
+                const fallback = await this.findEditableField();
+                if (fallback) {
+                    console.warn(`Falling back to editable field: ${fallback}`);
+                    await this.page.fill(fallback, value, { timeout: 5000 });
+                    filled = true;
+                    usedSelector = fallback;
+                }
+            }
+
+            if (!filled) {
+                console.error(`Fill failed: selector matches no elements: ${selector}`);
+                throw e;
             }
         }
 
         // Submit search inputs with Enter so the search actually runs even when
         // the page has no separate (or not-yet-rendered) submit button.
-        if (filled && await this.isSearchInput(selector)) {
-            console.log(`Submitting search input with Enter: ${selector}`);
-            await this.page.press(selector, 'Enter', { timeout: 3000 }).catch((e) => {
-                console.warn(`Enter submit failed for ${selector}:`, e.message);
+        if (filled && await this.isSearchInput(usedSelector)) {
+            console.log(`Submitting search input with Enter: ${usedSelector}`);
+            await this.page.press(usedSelector, 'Enter', { timeout: 3000 }).catch((e) => {
+                console.warn(`Enter submit failed for ${usedSelector}:`, e.message);
             });
         }
 
         await this.page.waitForTimeout(500); // Wait for potential validation/UI updates
+        return usedSelector;
+    }
+
+    /**
+     * Find the best visible, enabled editable field on the page (search boxes
+     * first) and return a stable CSS selector for it. Skips credentials fields
+     * so a wrong selector never types into a password box.
+     */
+    private async findEditableField(): Promise<string | null> {
+        if (!this.page) return null;
+        try {
+            return await this.page.evaluate(() => {
+                const nodes = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"], [role="searchbox"], [role="textbox"]'));
+                let best: HTMLElement | null = null;
+                let bestScore = -1;
+                for (const n of nodes) {
+                    const el = n as HTMLElement;
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0' || r.width === 0 || r.height === 0) continue;
+                    if ((el as HTMLInputElement).disabled === true) continue;
+                    if ((el as HTMLInputElement).readOnly === true) continue;
+                    const tag = el.tagName.toLowerCase();
+                    if (tag === 'input') {
+                        const t = ((el as HTMLInputElement).type || 'text').toLowerCase();
+                        if (['hidden', 'checkbox', 'radio', 'submit', 'button', 'reset', 'file', 'range', 'color', 'image', 'password'].indexOf(t) !== -1) continue;
+                    }
+                    const hint = [
+                        el.getAttribute('type'),
+                        el.getAttribute('name'),
+                        el.getAttribute('placeholder'),
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('role'),
+                        el.getAttribute('id'),
+                        typeof el.className === 'string' ? el.className : ''
+                    ].filter(Boolean).join(' ').toLowerCase();
+                    let score = 0;
+                    if (/search|query/.test(hint)) score += 3;
+                    if (/private|privacy/.test(hint)) score += 1;
+                    if (tag === 'textarea') score += 1;
+                    const role = el.getAttribute('role');
+                    if (role === 'searchbox' || role === 'combobox' || role === 'textbox') score += 1;
+                    if (score > bestScore) { bestScore = score; best = el; }
+                }
+                if (!best) return null;
+                // Build a stable CSS selector (mirrors getPageContent) so the
+                // caller does not depend on a temporary marker attribute.
+                if (best.id) return '#' + best.id;
+                const path: string[] = [];
+                let node: Element | null = best;
+                while (node && node.nodeType === Node.ELEMENT_NODE) {
+                    let selector = node.nodeName.toLowerCase();
+                    if (node.id) {
+                        selector += '#' + node.id;
+                        path.unshift(selector);
+                        break;
+                    } else {
+                        let sib: Element | null = node;
+                        let nth = 1;
+                        while (sib = sib.previousElementSibling) {
+                            if (sib.nodeName.toLowerCase() == selector) nth++;
+                        }
+                        if (nth != 1) selector += ':nth-of-type(' + nth + ')';
+                    }
+                    path.unshift(selector);
+                    node = node.parentNode as Element;
+                }
+                return path.join(' > ');
+            });
+        } catch {
+            return null;
+        }
     }
 
     private async isSearchInput(selector: string): Promise<boolean> {
         if (!this.page) return false;
         try {
             return await this.page.evaluate((sel: string) => {
-                const el = document.querySelector(sel) as HTMLInputElement | null;
-                if (!el || el.tagName.toLowerCase() !== 'input') return false;
-                const hint = `${el.getAttribute('type') || ''} ${el.getAttribute('placeholder') || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('name') || ''} ${typeof el.className === 'string' ? el.className : ''}`;
-                return /search/i.test(hint);
+                const el = document.querySelector(sel) as HTMLInputElement | HTMLTextAreaElement | null;
+                if (!el) return false;
+                const tag = el.tagName.toLowerCase();
+                if (tag !== 'input' && tag !== 'textarea') return false;
+                const hint = `${el.getAttribute('type') || ''} ${el.getAttribute('placeholder') || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('name') || ''} ${el.getAttribute('role') || ''} ${typeof el.className === 'string' ? el.className : ''}`;
+                return /search|query|private|privacy|\bq\b/i.test(hint);
             }, selector);
         } catch {
             return false;
@@ -155,19 +298,19 @@ class BrowserManager {
                 const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
                 let best: HTMLElement | null = null;
                 let bestScore = 0;
-                candidates.forEach(c => {
+                for (const c of candidates) {
                     const el = c as HTMLElement;
                     const s = window.getComputedStyle(el);
                     const r = el.getBoundingClientRect();
-                    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0' || r.width === 0 || r.height === 0) return;
-                    if (el === target || el.contains(target)) return;
+                    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0' || r.width === 0 || r.height === 0) continue;
+                    if (el === target || el.contains(target)) continue;
                     const hay = [el.getAttribute('aria-label'), el.getAttribute('title'), el.id, typeof el.className === 'string' ? el.className : '', el.innerText].filter(Boolean).join(' ').toLowerCase();
                     let score = 0;
                     // Match tokens at word boundaries so e.g. "enter" does not
                     // match "align-items-center".
                     tokens.forEach(t => { if (new RegExp('(^|[^a-z0-9])' + t).test(hay)) score++; });
                     if (score > bestScore) { bestScore = score; best = el; }
-                });
+                }
                 if (!best || bestScore === 0) return 'no-trigger';
                 best.setAttribute(args.marker, '1');
                 return 'trigger';
@@ -204,6 +347,29 @@ class BrowserManager {
         if (!this.page) return 0;
         try {
             return await this.page.locator(selector).count();
+        } catch {
+            return 0;
+        }
+    }
+
+    /**
+     * Count matches that are actually clickable/fillable (visible + enabled).
+     * A selector that only matches disabled or hidden elements is not useful.
+     */
+    public async countActionableMatches(selector: string): Promise<number> {
+        if (!this.page) return 0;
+        try {
+            const locator = this.page.locator(selector);
+            const count = await locator.count();
+            let actionable = 0;
+            for (let i = 0; i < count; i++) {
+                const candidate = locator.nth(i);
+                const visible = await candidate.isVisible().catch(() => false);
+                if (!visible) continue;
+                const enabled = await candidate.isEnabled().catch(() => false);
+                if (enabled) actionable++;
+            }
+            return actionable;
         } catch {
             return 0;
         }
@@ -338,10 +504,14 @@ class BrowserManager {
                     selectors: { css, id: el.id || null },
                     attributes: {
                         href: el.getAttribute('href') || null,
+                        name: el.getAttribute('name') || null,
                         src: el.getAttribute('src') || null,
                         ariaLabel: el.getAttribute('aria-label') || null,
                         title: el.getAttribute('title') || null,
-                        className: typeof (el as HTMLElement).className === 'string' ? ((el as HTMLElement).className || null) : null
+                        className: typeof (el as HTMLElement).className === 'string' ? ((el as HTMLElement).className || null) : null,
+                        tagName: tagName,
+                        inputType: el.getAttribute('type') || null,
+                        disabled: (el as HTMLInputElement).disabled === true
                     },
                     geometry: {
                         x: Math.round(rect.x + window.scrollX),

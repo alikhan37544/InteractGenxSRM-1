@@ -201,7 +201,10 @@ export class ActionExecutor {
 
         const selector = await this.findBestSelector(instruction.target, contextAnalysis, hooks);
         
-        await browserManager.fillElement(selector, instruction.value);
+        // fillElement returns the selector actually used: it falls back to the
+        // best visible editable field when the provided selector matches
+        // nothing (e.g. input[name='q'] on a site that uses a textarea).
+        const usedSelector = await browserManager.fillElement(selector, instruction.value);
         
         const newContext = await this.contextManager.getCurrentContext();
 
@@ -209,7 +212,7 @@ export class ActionExecutor {
             success: true,
             instructionId: instruction.id,
             action: instruction.action,
-            result: { selector, value: instruction.value, filled: true },
+            result: { selector: usedSelector, requestedSelector: selector, value: instruction.value, filled: true },
             newContext
         };
     }
@@ -331,7 +334,20 @@ export class ActionExecutor {
             return exactMatch.selectors.css || exactMatch.selectors.id || target;
         }
 
-        // Try to find by text content or semantic attributes (aria-label, class, placeholder)
+        // If the target is already a CSS selector that matches an actionable
+        // (visible + enabled) element, use it as-is. Selectors that only match
+        // disabled/hidden elements (e.g. a submit button that activates after
+        // the search box is filled) are not good enough — resolve instead.
+        const looksLikeSelector = /[#\[\].>:]/.test(target) && !/\s/.test(target.trim());
+        if (looksLikeSelector) {
+            const actionable = await browserManager.countActionableMatches(target);
+            if (actionable > 0) {
+                return target;
+            }
+        }
+
+        // Try to find by text content or semantic attributes (aria-label, class,
+        // placeholder, name, tag)
         const textMatch = contextAnalysis.availableElements.find(el => {
             const haystack = [
                 el.content?.text,
@@ -339,6 +355,8 @@ export class ActionExecutor {
                 el.attributes?.ariaLabel,
                 el.attributes?.className,
                 el.attributes?.title,
+                el.attributes?.name,
+                el.attributes?.tagName,
                 el.selectors?.id
             ].filter(Boolean).join(' ').toLowerCase();
             return haystack.includes(targetLower);
@@ -347,10 +365,14 @@ export class ActionExecutor {
             return textMatch.selectors.css || textMatch.selectors.id || target;
         }
 
-        // Try relevant elements
-        if (contextAnalysis.relevantElements.length > 0) {
-            const bestMatch = contextAnalysis.relevantElements[0];
-            return bestMatch.selectors.css || bestMatch.selectors.id || target;
+        // Try relevant elements, but only if their selector still matches an
+        // actionable element on the live page (the page may have changed since
+        // the context snapshot). Cap the scan to bound the round-trips.
+        for (const candidate of contextAnalysis.relevantElements.slice(0, 20)) {
+            const selector = candidate.selectors.css || candidate.selectors.id;
+            if (selector && await browserManager.countActionableMatches(selector) > 0) {
+                return selector;
+            }
         }
 
         // Use LLM to find better selector if available
@@ -387,7 +409,7 @@ export class ActionExecutor {
             // Rank elements by keyword overlap with the target so the most likely
             // candidates make it into the prompt, then pad with the page's leading
             // (usually header/nav) elements.
-            const targetTokens = instruction.target
+            const targetTokens = (instruction.target || '')
                 .toLowerCase()
                 .split(/[^a-z0-9]+/)
                 .filter(t => t.length >= 3);
@@ -398,6 +420,8 @@ export class ActionExecutor {
                     el.attributes?.ariaLabel,
                     el.attributes?.className,
                     el.attributes?.title,
+                    el.attributes?.name,
+                    el.attributes?.tagName,
                     el.selectors?.id
                 ].filter(Boolean).join(' ').toLowerCase();
                 let score = 0;
@@ -429,6 +453,10 @@ ${JSON.stringify(unique.map(el => ({
     selector: el.selectors?.css || '',
     id: el.selectors?.id || null,
     type: el.type,
+    tag: el.attributes?.tagName || null,
+    name: el.attributes?.name || null,
+    inputType: el.attributes?.inputType || null,
+    disabled: el.attributes?.disabled || false,
     placeholder: el.content?.placeholder || null,
     ariaLabel: el.attributes?.ariaLabel || null,
     className: el.attributes?.className || null
@@ -436,6 +464,8 @@ ${JSON.stringify(unique.map(el => ({
 
 Rules:
 - Prefer a selector from the list above that matches the target description.
+- Prefer visible, enabled elements. Never return a selector that only matches a disabled element.
+- Match the element kind to the action: use an input/textarea for filling, and a button/link for clicking.
 - The target element may be hidden behind a toggle (e.g. a collapsed search box). If no listed element matches, return a standard CSS selector that matches it (for example "input[type='search']" for a search box).
 - Return only the selector, never "none".`;
 
