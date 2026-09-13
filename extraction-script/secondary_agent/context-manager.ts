@@ -1,7 +1,7 @@
 // Secondary Agent: Context Manager
 // Understands database structure, current page context, and available elements
 
-import { AgentContext, DBSchemaInfo, PageElement } from '@/shared/types';
+import { AgentContext, DBSchemaInfo, PageElement, RecentPage } from '@/shared/types';
 import { ContextAnalysis } from './types';
 
 // Dynamic imports for extraction-script modules
@@ -62,12 +62,15 @@ export class ContextManager {
                 ? pageContent.elements 
                 : dbElements;
 
+            const recentPages = await this.getRecentPages();
+
             return {
                 currentUrl: pageContent.url,
                 currentPageTitle: pageContent.title,
                 availableElements,
                 dbSchema,
-                sessionContext: {}
+                sessionContext: {},
+                recentPages
             };
 
         } catch (error) {
@@ -120,6 +123,26 @@ export class ContextManager {
             dbElementCount: dbElementCount[0]?.count || 0,
             hasContext: context.availableElements.length > 0
         };
+    }
+
+    /**
+     * Get the most recently visited/scraped pages (newest first).
+     */
+    private async getRecentPages(): Promise<RecentPage[]> {
+        await this.ensureInitialized();
+        try {
+            const rows = await query(
+                'SELECT url, title, last_scraped_at FROM scraped_pages ORDER BY last_scraped_at DESC LIMIT 5'
+            ) as Array<{ url: string; title: string | null; last_scraped_at: any }>;
+            return rows.map(row => ({
+                url: row.url,
+                title: row.title || '',
+                lastScrapedAt: row.last_scraped_at ? String(row.last_scraped_at) : undefined
+            }));
+        } catch (error) {
+            console.error('Error getting recent pages:', error);
+            return [];
+        }
     }
 
     /**

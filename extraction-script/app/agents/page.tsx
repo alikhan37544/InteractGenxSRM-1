@@ -9,7 +9,10 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Send, Loader2, CheckCircle2, XCircle, Info, Settings, Play, Brain } from "lucide-react";
+import { Send, Loader2, CheckCircle2, XCircle, Info, Settings, Play, Brain, Sparkles } from "lucide-react";
+import LiveStreamPanel, { emptyStreamState, StreamState } from "@/components/LiveStreamPanel";
+import LiveActivityPanel from "@/components/LiveActivityPanel";
+import type { StreamEvent } from "@/shared/streaming";
 
 interface AgentResponse {
   success: boolean;
@@ -47,6 +50,7 @@ interface AgentResponse {
     };
     requiresClarification?: boolean;
     clarificationQuestions?: string[];
+    finalResponse?: string;
   };
   error?: string;
 }
@@ -58,6 +62,7 @@ export default function AgentsPage() {
   const [response, setResponse] = useState<AgentResponse | null>(null);
   const [primaryAgentUrl, setPrimaryAgentUrl] = useState("http://localhost:3001");
   const [history, setHistory] = useState<Array<{ input: string; response: AgentResponse; timestamp: Date }>>([]);
+  const [stream, setStream] = useState<StreamState>(emptyStreamState());
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -65,9 +70,61 @@ export default function AgentsPage() {
 
     setIsLoading(true);
     setResponse(null);
+    setStream(emptyStreamState());
+
+    const applyEvent = (event: StreamEvent) => {
+      setStream((prev) => {
+        const next: StreamState = {
+          ...prev,
+          phases: { ...prev.phases },
+          liveText: { ...prev.liveText },
+          thinkingByPhase: { ...prev.thinkingByPhase },
+          tokensByPhase: { ...prev.tokensByPhase },
+        };
+
+        if (event.type === "phase" && event.phase) {
+          const phase = event.phase;
+          if (event.status === "started") {
+            next.phases[phase] = "started";
+            next.currentPhase = phase;
+            next.progress = 0;
+            next.etaDeadline = event.etaMs != null ? Date.now() + event.etaMs : null;
+            next.overallEtaDeadline = event.overallEtaMs != null ? Date.now() + event.overallEtaMs : null;
+          } else if (event.status === "done") {
+            next.phases[phase] = "done";
+            if (next.currentPhase === phase) next.currentPhase = null;
+            if (event.tokens != null) next.tokensByPhase[phase] = event.tokens;
+            next.progress = 1;
+            next.etaDeadline = null;
+            next.overallEtaDeadline = null;
+          }
+        } else if (event.type === "token" && event.phase) {
+          const phase = event.phase;
+          next.phases[phase] = next.phases[phase] || "started";
+          next.currentPhase = phase;
+          next.liveText[phase] = (next.liveText[phase] || "") + (event.text || "");
+          next.tokensByPhase[phase] = event.tokens ?? (next.tokensByPhase[phase] || 0) + 1;
+          next.tokensPerSec = event.tokensPerSec ?? next.tokensPerSec;
+          next.progress = event.progress ?? next.progress;
+          next.etaDeadline = event.etaMs != null ? Date.now() + event.etaMs : null;
+          next.overallEtaDeadline = event.overallEtaMs != null ? Date.now() + event.overallEtaMs : null;
+        } else if (event.type === "thinking" && event.phase) {
+          const phase = event.phase;
+          next.phases[phase] = next.phases[phase] || "started";
+          next.currentPhase = phase;
+          next.thinkingByPhase[phase] = (next.thinkingByPhase[phase] || "") + (event.text || "");
+          next.tokensPerSec = event.tokensPerSec ?? next.tokensPerSec;
+          next.progress = event.progress ?? next.progress;
+          next.etaDeadline = event.etaMs != null ? Date.now() + event.etaMs : null;
+          next.overallEtaDeadline = event.overallEtaMs != null ? Date.now() + event.overallEtaMs : null;
+        }
+
+        return next;
+      });
+    };
 
     try {
-      const response = await fetch(`${primaryAgentUrl}/process`, {
+      const response = await fetch(`${primaryAgentUrl}/process/stream`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -78,18 +135,62 @@ export default function AgentsPage() {
         }),
       });
 
-      const data: AgentResponse = await response.json();
-
       if (!response.ok) {
-        throw new Error(data.error || "Failed to process request");
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.error || "Failed to process request");
       }
 
-      setResponse(data);
-      setHistory((prev) => [
-        { input: userInput, response: data, timestamp: new Date() },
-        ...prev.slice(0, 9), // Keep last 10 items
-      ]);
-      setUserInput(""); // Clear input after successful submission
+      if (!response.body) {
+        throw new Error("Streaming is not supported by this browser");
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalData: AgentResponse | null = null;
+      let streamError: string | null = null;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() || "";
+
+        for (const part of parts) {
+          const dataLine = part.split("\n").find((line) => line.startsWith("data: "));
+          if (!dataLine) continue;
+
+          let event: StreamEvent;
+          try {
+            event = JSON.parse(dataLine.slice(6));
+          } catch {
+            continue;
+          }
+
+          if (event.type === "done") {
+            finalData = { success: true, data: event.data };
+          } else if (event.type === "error") {
+            streamError = event.error || "An error occurred";
+          } else {
+            applyEvent(event);
+          }
+        }
+      }
+
+      if (streamError) {
+        setResponse({ success: false, error: streamError });
+      } else if (finalData) {
+        setResponse(finalData);
+        setHistory((prev) => [
+          { input: userInput, response: finalData, timestamp: new Date() },
+          ...prev.slice(0, 9), // Keep last 10 items
+        ]);
+        setUserInput(""); // Clear input after successful submission
+      } else {
+        setResponse({ success: false, error: "Stream ended without a result" });
+      }
     } catch (error: any) {
       setResponse({
         success: false,
@@ -230,7 +331,9 @@ export default function AgentsPage() {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              {!response ? (
+              {isLoading ? (
+                <LiveStreamPanel stream={stream} />
+              ) : !response ? (
                 <p className="text-zinc-400 text-center py-8">
                   Enter instructions and click Send to see the response
                 </p>
@@ -241,6 +344,17 @@ export default function AgentsPage() {
                 </div>
               ) : (
                 <ScrollArea className="h-[500px] pr-4">
+                  {response.data?.finalResponse && (
+                    <div className="mb-4 rounded-md border border-blue-700/60 bg-blue-900/20 p-4">
+                      <div className="flex items-center gap-2 mb-2">
+                        <Sparkles className="w-4 h-4 text-blue-300" />
+                        <span className="text-blue-200 font-semibold text-sm">Answer</span>
+                      </div>
+                      <p className="text-zinc-100 whitespace-pre-wrap leading-relaxed">
+                        {response.data.finalResponse}
+                      </p>
+                    </div>
+                  )}
                   <Tabs defaultValue="intent" className="w-full">
                     <TabsList className="grid w-full grid-cols-3 bg-zinc-700">
                       <TabsTrigger value="intent">Intent</TabsTrigger>
@@ -418,6 +532,11 @@ export default function AgentsPage() {
               )}
             </CardContent>
           </Card>
+        </div>
+
+        {/* Live Server Activity */}
+        <div className="mt-6">
+          <LiveActivityPanel url={primaryAgentUrl} />
         </div>
 
         {/* History */}

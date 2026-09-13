@@ -2,6 +2,7 @@
 // Coordinates context understanding and action execution
 
 import { AgentInstruction, AgentContext } from '@/shared/types';
+import { AgentStreamHooks } from '@/shared/streaming';
 import { ContextManager } from './context-manager';
 import { ActionExecutor } from './action-executor';
 import { SecondaryAgentConfig, SecondaryAgentResponse, ExecutionResult } from './types';
@@ -13,7 +14,7 @@ export class SecondaryAgent {
 
     constructor(config?: Partial<SecondaryAgentConfig>) {
         this.config = {
-            model: config?.model || 'google/gemma-3-1b-it',
+            model: config?.model || 'google/gemma-4-12b-qat',
             temperature: config?.temperature || 0.2,
             maxRetries: config?.maxRetries || 2
         };
@@ -30,7 +31,8 @@ export class SecondaryAgent {
      * Execute a sequence of instructions
      */
     async executeInstructions(
-        instructions: AgentInstruction[]
+        instructions: AgentInstruction[],
+        hooks?: AgentStreamHooks
     ): Promise<SecondaryAgentResponse> {
         const executionResults: ExecutionResult[] = [];
         const errors: string[] = [];
@@ -40,6 +42,8 @@ export class SecondaryAgent {
             // Get initial context
             currentContext = await this.contextManager.getCurrentContext();
 
+            hooks?.onPhaseStart?.('execution');
+
             // Execute each instruction sequentially
             for (const instruction of instructions) {
                 try {
@@ -47,7 +51,7 @@ export class SecondaryAgent {
                     const contextAnalysis = await this.contextManager.analyzeContextForInstruction(instruction);
 
                     // Execute the instruction
-                    const result = await this.actionExecutor.executeInstruction(instruction, contextAnalysis);
+                    const result = await this.actionExecutor.executeInstruction(instruction, contextAnalysis, hooks);
 
                     executionResults.push(result);
 
@@ -76,6 +80,8 @@ export class SecondaryAgent {
 
             // Final context update
             currentContext = await this.contextManager.getCurrentContext();
+
+            hooks?.onPhaseEnd?.('execution');
 
             const allSuccessful = executionResults.every(r => r.success);
 

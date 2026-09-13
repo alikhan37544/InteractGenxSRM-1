@@ -10,12 +10,20 @@ export interface AgentInstruction {
     metadata?: Record<string, any>;
 }
 
+export interface RecentPage {
+    url: string;
+    title: string;
+    lastScrapedAt?: string;
+}
+
 export interface AgentContext {
     currentUrl: string;
     currentPageTitle: string;
     availableElements: PageElement[];
     dbSchema: DBSchemaInfo;
     sessionContext?: Record<string, any>;
+    /** Pages the agent has visited before (most recent first). */
+    recentPages?: RecentPage[];
 }
 
 export interface PageElement {
@@ -31,6 +39,10 @@ export interface PageElement {
     attributes?: {
         href?: string | null;
         name?: string | null;
+        src?: string | null;
+        ariaLabel?: string | null;
+        title?: string | null;
+        className?: string | null;
     };
     geometry?: {
         x: number;

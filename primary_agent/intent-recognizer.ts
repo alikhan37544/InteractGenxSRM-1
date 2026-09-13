@@ -14,12 +14,17 @@ export class IntentRecognizer {
     private model: string;
     private temperature: number;
 
-    constructor(model: string = 'google/gemma-3-1b-it', temperature: number = 0.3) {
+    constructor(model: string = 'google/gemma-4-12b-qat', temperature: number = 0.3) {
         this.model = model;
         this.temperature = temperature;
     }
 
-    async recognizeIntent(userInput: string, conversationHistory?: Array<{role: string, content: string}>): Promise<IntentRecognitionResult> {
+    async recognizeIntent(
+        userInput: string,
+        conversationHistory?: Array<{role: string, content: string}>,
+        onToken?: (text: string) => void,
+        onThinking?: (text: string) => void
+    ): Promise<IntentRecognitionResult> {
         const systemPrompt = `You are an expert intent recognition system. Your job is to understand what the user wants to do on a website.
 
 Analyze the user's input and extract:
@@ -70,13 +75,35 @@ Analyze this input and extract the intent, entities, and context.`;
                 messages.splice(-1, 0, ...conversationHistory);
             }
 
-            const completion = await openai.chat.completions.create({
-                model: this.model,
-                messages,
-                temperature: this.temperature
-            });
+            let content: string;
+            if (onToken) {
+                const stream = await openai.chat.completions.create({
+                    model: this.model,
+                    messages,
+                    temperature: this.temperature,
+                    stream: true
+                });
+                content = '';
+                for await (const chunk of stream) {
+                    const delta = chunk.choices[0]?.delta?.content || '';
+                    const reasoning = (chunk.choices[0]?.delta as any)?.reasoning_content || '';
+                    if (reasoning) {
+                        onThinking?.(reasoning);
+                    }
+                    if (delta) {
+                        content += delta;
+                        onToken(delta);
+                    }
+                }
+            } else {
+                const completion = await openai.chat.completions.create({
+                    model: this.model,
+                    messages,
+                    temperature: this.temperature
+                });
+                content = completion.choices[0].message.content || '';
+            }
 
-            const content = completion.choices[0].message.content;
             if (!content) {
                 throw new Error('No response from LLM');
             }

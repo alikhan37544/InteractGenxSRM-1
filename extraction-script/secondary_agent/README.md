@@ -31,12 +31,16 @@ npm start
       }
     ],
     "config": {
-      "model": "google/gemma-3-1b-it",
+      "model": "google/gemma-4-12b-qat",
       "temperature": 0.2,
       "maxRetries": 2
     }
   }
   ```
+- **Execute Instructions (Streaming)**: `POST http://localhost:3002/execute/stream`
+  Same body as `/execute`, but responds with `text/event-stream`. Streams
+  execution phase events and the LLM selector-resolution token output, then a
+  final `done` event with the full `SecondaryAgentResponse`.
 
 ## Port
 

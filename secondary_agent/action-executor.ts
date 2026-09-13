@@ -3,6 +3,7 @@
 
 import OpenAI from 'openai';
 import { AgentInstruction, PageElement } from '../shared/types';
+import { AgentStreamHooks } from '../shared/streaming';
 import { ContextAnalysis, ExecutionResult } from './types';
 import { ContextManager } from './context-manager';
 
@@ -33,7 +34,7 @@ export class ActionExecutor {
     private maxRetries: number;
     private initialized = false;
 
-    constructor(model: string = 'google/gemma-3-1b-it', temperature: number = 0.2, maxRetries: number = 2) {
+    constructor(model: string = 'google/gemma-4-12b-qat', temperature: number = 0.2, maxRetries: number = 2) {
         this.contextManager = new ContextManager();
         this.model = model;
         this.temperature = temperature;
@@ -52,7 +53,8 @@ export class ActionExecutor {
      */
     async executeInstruction(
         instruction: AgentInstruction,
-        contextAnalysis: ContextAnalysis
+        contextAnalysis: ContextAnalysis,
+        hooks?: AgentStreamHooks
     ): Promise<ExecutionResult> {
         await this.ensureInitialized();
 
@@ -68,10 +70,10 @@ export class ActionExecutor {
                         return await this.executeNavigate(instruction, contextAnalysis);
                     
                     case 'click':
-                        return await this.executeClick(instruction, contextAnalysis);
+                        return await this.executeClick(instruction, contextAnalysis, hooks);
                     
                     case 'fill':
-                        return await this.executeFill(instruction, contextAnalysis);
+                        return await this.executeFill(instruction, contextAnalysis, hooks);
                     
                     case 'extract':
                         return await this.executeExtract(instruction, contextAnalysis);
@@ -92,7 +94,7 @@ export class ActionExecutor {
 
                 // If we have retries left and it's a selector issue, try to find better selector
                 if (attempts < this.maxRetries && (instruction.action === 'click' || instruction.action === 'fill')) {
-                    const improvedSelector = await this.improveSelector(instruction, contextAnalysis);
+                    const improvedSelector = await this.improveSelector(instruction, contextAnalysis, hooks);
                     if (improvedSelector) {
                         instruction.target = improvedSelector;
                     }
@@ -128,11 +130,22 @@ export class ActionExecutor {
         // Get updated context
         const newContext = await this.contextManager.getCurrentContext();
 
-        // Save to database
-        await query(
-            'INSERT INTO scraped_pages (url, title) VALUES (?, ?) ON DUPLICATE KEY UPDATE title = VALUES(title), last_scraped_at = CURRENT_TIMESTAMP',
-            [newContext.currentUrl, newContext.currentPageTitle]
-        );
+        // Remember the visited page so the agent can reference it later.
+        // Recording must never break navigation, so failures are non-fatal.
+        try {
+            const dbUrl = (newContext.currentUrl || '').slice(0, 2048);
+            const dbTitle = (newContext.currentPageTitle || '').slice(0, 512);
+            await query(
+                'INSERT INTO scraped_pages (url, title, full_url) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE title = VALUES(title), full_url = VALUES(full_url), last_scraped_at = CURRENT_TIMESTAMP',
+                [dbUrl, dbTitle, newContext.currentUrl]
+            );
+            await query(
+                'INSERT INTO scraping_history (page_url, action, element_count, notes) VALUES (?, ?, ?, ?)',
+                [dbUrl, 'navigate', newContext.availableElements.length, 'Visited by agent']
+            );
+        } catch (dbError) {
+            console.warn('Failed to record visited page:', dbError);
+        }
 
         return {
             success: true,
@@ -148,14 +161,15 @@ export class ActionExecutor {
      */
     private async executeClick(
         instruction: AgentInstruction,
-        contextAnalysis: ContextAnalysis
+        contextAnalysis: ContextAnalysis,
+        hooks?: AgentStreamHooks
     ): Promise<ExecutionResult> {
         if (!instruction.target) {
             throw new Error('Click action requires a target selector');
         }
 
         // Find the best selector
-        const selector = await this.findBestSelector(instruction.target, contextAnalysis);
+        const selector = await this.findBestSelector(instruction.target, contextAnalysis, hooks);
         
         await browserManager.clickElement(selector);
         
@@ -178,13 +192,14 @@ export class ActionExecutor {
      */
     private async executeFill(
         instruction: AgentInstruction,
-        contextAnalysis: ContextAnalysis
+        contextAnalysis: ContextAnalysis,
+        hooks?: AgentStreamHooks
     ): Promise<ExecutionResult> {
         if (!instruction.target || !instruction.value) {
             throw new Error('Fill action requires both target selector and value');
         }
 
-        const selector = await this.findBestSelector(instruction.target, contextAnalysis);
+        const selector = await this.findBestSelector(instruction.target, contextAnalysis, hooks);
         
         await browserManager.fillElement(selector, instruction.value);
         
@@ -208,29 +223,40 @@ export class ActionExecutor {
     ): Promise<ExecutionResult> {
         const pageContent = await browserManager.getPageContent();
 
+        // Keep values within their column limits while preserving the
+        // original URL in full_url.
+        const dbUrl = pageContent.url.slice(0, 2048);
+        const dbTitle = (pageContent.title || '').slice(0, 512);
+
         // Save to database
         await query(
-            'INSERT INTO scraped_pages (url, title) VALUES (?, ?) ON DUPLICATE KEY UPDATE title = VALUES(title), last_scraped_at = CURRENT_TIMESTAMP',
-            [pageContent.url, pageContent.title]
+            'INSERT INTO scraped_pages (url, title, full_url) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE title = VALUES(title), full_url = VALUES(full_url), last_scraped_at = CURRENT_TIMESTAMP',
+            [dbUrl, dbTitle, pageContent.url]
         );
 
-        await query('DELETE FROM elements WHERE page_url = ?', [pageContent.url]);
+        await query('DELETE FROM elements WHERE page_url = ?', [dbUrl]);
 
         if (pageContent.elements.length > 0) {
-            for (const el of pageContent.elements) {
+            const rows = pageContent.elements.map((el: PageElement) => [
+                dbUrl,
+                el.type,
+                JSON.stringify(el.content),
+                JSON.stringify(el.selectors),
+                JSON.stringify(el.attributes || {}),
+                JSON.stringify(el.geometry)
+            ]);
+            const chunkSize = 100;
+            for (let i = 0; i < rows.length; i += chunkSize) {
+                const chunk = rows.slice(i, i + chunkSize);
+                const placeholders = chunk.map(() => '(?, ?, ?, ?, ?, ?)').join(', ');
                 await query(
-                    'INSERT INTO elements (page_url, type, content, selectors, attributes, geometry) VALUES (?, ?, ?, ?, ?, ?)',
-                    [
-                        pageContent.url,
-                        el.type,
-                        JSON.stringify(el.content),
-                        JSON.stringify(el.selectors),
-                        JSON.stringify(el.attributes || {}),
-                        JSON.stringify(el.geometry)
-                    ]
+                    `INSERT INTO elements (page_url, type, content, selectors, attributes, geometry) VALUES ${placeholders}`,
+                    chunk.flat()
                 );
             }
         }
+
+        await query('UPDATE scraped_pages SET element_count = ? WHERE url = ?', [pageContent.elements.length, dbUrl]);
 
         const newContext = await this.contextManager.getCurrentContext();
 
@@ -292,8 +318,11 @@ export class ActionExecutor {
      */
     private async findBestSelector(
         target: string,
-        contextAnalysis: ContextAnalysis
+        contextAnalysis: ContextAnalysis,
+        hooks?: AgentStreamHooks
     ): Promise<string> {
+        const targetLower = target.toLowerCase();
+
         // First, try exact match
         const exactMatch = contextAnalysis.availableElements.find(el =>
             el.selectors.css === target || el.selectors.id === target
@@ -302,10 +331,18 @@ export class ActionExecutor {
             return exactMatch.selectors.css || exactMatch.selectors.id || target;
         }
 
-        // Try to find by text content
-        const textMatch = contextAnalysis.availableElements.find(el =>
-            el.content.text.toLowerCase().includes(target.toLowerCase())
-        );
+        // Try to find by text content or semantic attributes (aria-label, class, placeholder)
+        const textMatch = contextAnalysis.availableElements.find(el => {
+            const haystack = [
+                el.content?.text,
+                el.content?.placeholder,
+                el.attributes?.ariaLabel,
+                el.attributes?.className,
+                el.attributes?.title,
+                el.selectors?.id
+            ].filter(Boolean).join(' ').toLowerCase();
+            return haystack.includes(targetLower);
+        });
         if (textMatch) {
             return textMatch.selectors.css || textMatch.selectors.id || target;
         }
@@ -320,7 +357,8 @@ export class ActionExecutor {
         try {
             const improved = await this.improveSelector(
                 { action: 'click', target } as AgentInstruction,
-                contextAnalysis
+                contextAnalysis,
+                hooks
             );
             if (improved) return improved;
         } catch (error) {
@@ -336,49 +374,157 @@ export class ActionExecutor {
      */
     private async improveSelector(
         instruction: AgentInstruction,
-        contextAnalysis: ContextAnalysis
+        contextAnalysis: ContextAnalysis,
+        hooks?: AgentStreamHooks
     ): Promise<string | null> {
         if (contextAnalysis.availableElements.length === 0) {
             return null;
         }
 
         try {
+            hooks?.onPhaseStart?.('selector_resolution');
+
+            // Rank elements by keyword overlap with the target so the most likely
+            // candidates make it into the prompt, then pad with the page's leading
+            // (usually header/nav) elements.
+            const targetTokens = instruction.target
+                .toLowerCase()
+                .split(/[^a-z0-9]+/)
+                .filter(t => t.length >= 3);
+            const scored = contextAnalysis.availableElements.map((el, index) => {
+                const haystack = [
+                    el.content?.text,
+                    el.content?.placeholder,
+                    el.attributes?.ariaLabel,
+                    el.attributes?.className,
+                    el.attributes?.title,
+                    el.selectors?.id
+                ].filter(Boolean).join(' ').toLowerCase();
+                let score = 0;
+                for (const token of targetTokens) {
+                    if (haystack.includes(token)) score++;
+                }
+                return { el, index, score };
+            });
+            const ordered = [
+                ...scored.filter(s => s.score > 0).sort((a, b) => b.score - a.score || a.index - b.index).map(s => s.el),
+                ...scored.map(s => s.el)
+            ];
+            const unique: PageElement[] = [];
+            const seen = new Set<string>();
+            for (const el of ordered) {
+                const key = el.selectors?.css || '';
+                if (key && !seen.has(key)) {
+                    seen.add(key);
+                    unique.push(el);
+                }
+                if (unique.length >= 25) break;
+            }
+
             const prompt = `Given a target description "${instruction.target}" and available page elements, find the best CSS selector.
 
-Available elements (first 10):
-${JSON.stringify(contextAnalysis.availableElements.slice(0, 10).map(el => ({
-    text: el.content.text,
-    selector: el.selectors.css,
-    id: el.selectors.id,
-    type: el.type
+Available page elements:
+${JSON.stringify(unique.map(el => ({
+    text: el.content?.text || '',
+    selector: el.selectors?.css || '',
+    id: el.selectors?.id || null,
+    type: el.type,
+    placeholder: el.content?.placeholder || null,
+    ariaLabel: el.attributes?.ariaLabel || null,
+    className: el.attributes?.className || null
 })), null, 2)}
 
-Return only the best CSS selector as a JSON string: {"selector": "..."}`;
+Rules:
+- Prefer a selector from the list above that matches the target description.
+- The target element may be hidden behind a toggle (e.g. a collapsed search box). If no listed element matches, return a standard CSS selector that matches it (for example "input[type='search']" for a search box).
+- Return only the selector, never "none".`;
 
-            const completion = await openai.chat.completions.create({
-                model: this.model,
-                messages: [
-                    { role: 'system', content: 'You are a CSS selector expert. Return only valid JSON with a selector field.' },
-                    { role: 'user', content: prompt }
-                ],
-                temperature: this.temperature
-            });
+            const messages: OpenAI.ChatCompletionMessageParam[] = [
+                { role: 'system', content: 'You are a CSS selector expert. Pick a selector that matches the target. Respond with JSON only.' },
+                { role: 'user', content: prompt }
+            ];
 
-            const content = completion.choices[0].message.content;
+            const responseFormat = {
+                type: 'json_schema' as const,
+                json_schema: {
+                    name: 'selector_result',
+                    strict: true,
+                    schema: {
+                        type: 'object',
+                        properties: { selector: { type: 'string' } },
+                        required: ['selector'],
+                        additionalProperties: false
+                    }
+                }
+            };
+
+            let content: string | null = null;
+            if (hooks?.onToken) {
+                const stream = await openai.chat.completions.create({
+                    model: this.model,
+                    messages,
+                    temperature: this.temperature,
+                    max_tokens: 2048,
+                    response_format: responseFormat,
+                    stream: true
+                });
+                content = '';
+                for await (const chunk of stream) {
+                    const delta = chunk.choices[0]?.delta?.content || '';
+                    const reasoning = (chunk.choices[0]?.delta as any)?.reasoning_content || '';
+                    if (reasoning) {
+                        hooks?.onThinking?.('selector_resolution', reasoning);
+                    }
+                    if (delta) {
+                        content += delta;
+                        hooks.onToken('selector_resolution', delta);
+                    }
+                }
+            } else {
+                const completion = await openai.chat.completions.create({
+                    model: this.model,
+                    messages,
+                    temperature: this.temperature,
+                    max_tokens: 2048,
+                    response_format: responseFormat
+                });
+                content = completion.choices[0].message.content;
+            }
+
+            hooks?.onPhaseEnd?.('selector_resolution');
+
             if (content) {
+                let selector: string | null = null;
                 try {
                     // Remove markdown code blocks if present
                     const cleanedContent = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
                     const parsed = JSON.parse(cleanedContent);
-                    return parsed.selector || null;
+                    selector = parsed.selector || null;
                 } catch (parseError) {
                     // Try to extract JSON from the response
                     const jsonMatch = content.match(/\{[\s\S]*\}/);
                     if (jsonMatch) {
-                        const parsed = JSON.parse(jsonMatch[0]);
-                        return parsed.selector || null;
+                        try {
+                            const parsed = JSON.parse(jsonMatch[0]);
+                            selector = parsed.selector || null;
+                        } catch { /* ignore */ }
                     }
                 }
+
+                const cleaned = (selector || '').trim();
+                if (!cleaned || /^(none|null|undefined|n\/a)$/i.test(cleaned)) {
+                    console.warn(`Selector resolution returned unusable selector: "${cleaned}"`);
+                    return null;
+                }
+
+                // Verify the selector actually matches something on the page.
+                const matches = await browserManager.countMatches(cleaned);
+                if (matches === 0) {
+                    console.warn(`Selector resolution returned a selector with no matches: "${cleaned}"`);
+                    return null;
+                }
+
+                return cleaned;
             }
 
         } catch (error) {

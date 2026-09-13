@@ -88,7 +88,7 @@ export async function POST(req: Request) {
         await query(`
             INSERT INTO ai_analysis_log (page_url, elements_processed, elements_enriched, model_used, success)
             VALUES (?, ?, ?, ?, ?)
-        `, [url, parsedElements.length, updateCount, 'google/gemma-3-1b-it', true]);
+        `, [url, parsedElements.length, updateCount, 'google/gemma-4-12b-qat', true]);
 
         // 7. Return updated elements
         const updatedElements = await query('SELECT * FROM elements WHERE page_url = ?', [url]);
@@ -120,7 +120,7 @@ export async function POST(req: Request) {
             if (url) {
                 await query(`
                     INSERT INTO ai_analysis_log (page_url, elements_processed, elements_enriched, model_used, success, error_message)
-                    VALUES (?, 0, 0, 'google/gemma-3-1b-it', false, ?)
+                    VALUES (?, 0, 0, 'google/gemma-4-12b-qat', false, ?)
                 `, [url, error.message || 'Unknown error']);
             }
         } catch (logError) {

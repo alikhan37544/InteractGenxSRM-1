@@ -15,7 +15,7 @@ export class InstructionTranslator {
     private temperature: number;
     private maxInstructions: number;
 
-    constructor(model: string = 'google/gemma-3-1b-it', temperature: number = 0.2, maxInstructions: number = 5) {
+    constructor(model: string = 'google/gemma-4-12b-qat', temperature: number = 0.2, maxInstructions: number = 5) {
         this.model = model;
         this.temperature = temperature;
         this.maxInstructions = maxInstructions;
@@ -23,7 +23,9 @@ export class InstructionTranslator {
 
     async translateIntentToInstructions(
         intent: UserIntent,
-        currentContext?: { url?: string; pageTitle?: string }
+        currentContext?: { url?: string; pageTitle?: string; recentPages?: Array<{ url: string; title?: string }> },
+        onToken?: (text: string) => void,
+        onThinking?: (text: string) => void
     ): Promise<InstructionGenerationResult> {
         const systemPrompt = `You are an instruction generator for a web automation agent. Your job is to convert user intents into clear, step-by-step instructions that another agent can execute.
 
@@ -55,6 +57,11 @@ Generate a sequence of instructions as JSON:
     "reasoning": "overall strategy explanation"
 }
 
+Search guidance:
+- If the user asks for information that requires a general web search and did not name a specific site, prefer DuckDuckGo (https://duckduckgo.com/). Google frequently blocks automated browsers with a CAPTCHA.
+- A web search sequence is: navigate to the search site, fill the search box with the query, click the search/submit button, wait briefly for results, then extract the results.
+- If the user is already on a site that has its own search, prefer that site's search over a general search engine.
+
 Keep instructions clear, specific, and actionable. Maximum ${this.maxInstructions} instructions.`;
 
         const userPrompt = `User Intent:
@@ -64,20 +71,46 @@ Keep instructions clear, specific, and actionable. Maximum ${this.maxInstruction
 - Entities: ${JSON.stringify(intent.entities, null, 2)}
 
 ${currentContext ? `Current Context:\n- URL: ${currentContext.url || 'unknown'}\n- Page: ${currentContext.pageTitle || 'unknown'}` : 'No current context available.'}
+${currentContext?.recentPages?.length ? `\nRecently visited pages (already in memory):\n${currentContext.recentPages.map(p => `- ${p.title || p.url} (${p.url})`).join('\n')}` : ''}
 
 Generate clear, actionable instructions for the secondary agent to execute this intent.`;
 
         try {
-            const completion = await openai.chat.completions.create({
-                model: this.model,
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: userPrompt }
-                ],
-                temperature: this.temperature
-            });
+            let content: string;
+            if (onToken) {
+                const stream = await openai.chat.completions.create({
+                    model: this.model,
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt }
+                    ],
+                    temperature: this.temperature,
+                    stream: true
+                });
+                content = '';
+                for await (const chunk of stream) {
+                    const delta = chunk.choices[0]?.delta?.content || '';
+                    const reasoning = (chunk.choices[0]?.delta as any)?.reasoning_content || '';
+                    if (reasoning) {
+                        onThinking?.(reasoning);
+                    }
+                    if (delta) {
+                        content += delta;
+                        onToken(delta);
+                    }
+                }
+            } else {
+                const completion = await openai.chat.completions.create({
+                    model: this.model,
+                    messages: [
+                        { role: 'system', content: systemPrompt },
+                        { role: 'user', content: userPrompt }
+                    ],
+                    temperature: this.temperature
+                });
+                content = completion.choices[0].message.content || '';
+            }
 
-            const content = completion.choices[0].message.content;
             if (!content) {
                 throw new Error('No response from LLM');
             }

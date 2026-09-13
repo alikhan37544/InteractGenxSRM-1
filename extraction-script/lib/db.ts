@@ -35,7 +35,7 @@ async function ensureSchema() {
         // Table: scraped_pages - Enhanced with AI enrichment tracking
         await pool.query(`
           CREATE TABLE IF NOT EXISTS scraped_pages (
-            url VARCHAR(768) PRIMARY KEY,
+            url VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_general_ci PRIMARY KEY,
             full_url TEXT,
             title VARCHAR(512),
             last_scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -53,7 +53,7 @@ async function ensureSchema() {
         await pool.query(`
           CREATE TABLE IF NOT EXISTS elements (
             id INT AUTO_INCREMENT PRIMARY KEY,
-            page_url VARCHAR(768),
+            page_url VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_general_ci,
             type VARCHAR(50),
             content JSON,
             selectors JSON,
@@ -80,7 +80,7 @@ async function ensureSchema() {
         await pool.query(`
           CREATE TABLE IF NOT EXISTS scraping_history (
             id INT AUTO_INCREMENT PRIMARY KEY,
-            page_url VARCHAR(768),
+            page_url VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_general_ci,
             action VARCHAR(50) NOT NULL,
             element_count INT DEFAULT 0,
             notes TEXT,
@@ -93,7 +93,7 @@ async function ensureSchema() {
         await pool.query(`
           CREATE TABLE IF NOT EXISTS ai_analysis_log (
             id INT AUTO_INCREMENT PRIMARY KEY,
-            page_url VARCHAR(768),
+            page_url VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_general_ci,
             elements_processed INT DEFAULT 0,
             elements_enriched INT DEFAULT 0,
             model_used VARCHAR(100),
@@ -151,6 +151,52 @@ async function ensureSchema() {
             if (!e.message.includes("Duplicate column name") && e.code !== 'ER_DUP_FIELDNAME') {
                 // Ignore
             }
+        }
+
+        // Migration: widen URL columns so long URLs (e.g. search result pages)
+        // fit. utf8mb4 VARCHAR(768) is the maximum for an indexed column
+        // (3072 bytes); ascii uses 1 byte per char, allowing up to 3072 chars.
+        try {
+            const [fkRows]: any = await pool.query(`
+                SELECT TABLE_NAME, CONSTRAINT_NAME
+                FROM information_schema.KEY_COLUMN_USAGE
+                WHERE REFERENCED_TABLE_SCHEMA = DATABASE()
+                  AND REFERENCED_TABLE_NAME = 'scraped_pages'
+                  AND REFERENCED_COLUMN_NAME = 'url'
+            `);
+            for (const row of fkRows) {
+                try {
+                    await pool.query(`ALTER TABLE \`${row.TABLE_NAME}\` DROP FOREIGN KEY \`${row.CONSTRAINT_NAME}\``);
+                } catch (e: any) {
+                    // Ignore if the constraint is already gone
+                }
+            }
+
+            await pool.query(`ALTER TABLE scraped_pages MODIFY url VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_general_ci NOT NULL`);
+
+            const referencingTables = ['elements', 'scraping_history', 'ai_analysis_log'];
+            for (const table of referencingTables) {
+                try {
+                    await pool.query(`ALTER TABLE \`${table}\` MODIFY page_url VARCHAR(2048) CHARACTER SET ascii COLLATE ascii_general_ci`);
+                } catch (e: any) {
+                    console.error(`URL column migration warning for ${table}:`, e.message);
+                }
+            }
+
+            const fkDefs = [
+                { table: 'elements', name: 'fk_elements_page_url' },
+                { table: 'scraping_history', name: 'fk_scraping_history_page_url' },
+                { table: 'ai_analysis_log', name: 'fk_ai_analysis_log_page_url' }
+            ];
+            for (const fk of fkDefs) {
+                try {
+                    await pool.query(`ALTER TABLE \`${fk.table}\` ADD CONSTRAINT \`${fk.name}\` FOREIGN KEY (page_url) REFERENCES scraped_pages(url) ON DELETE CASCADE`);
+                } catch (e: any) {
+                    // Ignore duplicate constraint / missing table
+                }
+            }
+        } catch (e: any) {
+            console.error("URL column migration warning:", e.message);
         }
 
         schemaChecked = true;

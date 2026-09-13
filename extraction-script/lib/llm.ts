@@ -44,7 +44,7 @@ export async function enrichElements(html: string, elements: any[]) {
 
     try {
         const completion = await openai.chat.completions.create({
-            model: "google/gemma-3-1b-it", // Adjust model name to match what's loaded in LM Studio
+            model: "google/gemma-4-12b-qat", // Adjust model name to match what's loaded in LM Studio
             messages: [
                 { role: "system", content: "You are a helpful AI that analyzes web UIs. Output valid JSON only." },
                 { role: "user", content: prompt }

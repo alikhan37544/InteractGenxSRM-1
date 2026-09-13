@@ -51,24 +51,161 @@ class BrowserManager {
 
         try {
             await this.page.click(selector, { timeout: 5000 });
-            await this.page.waitForLoadState('domcontentloaded').catch(() => { }); // Catch if no nav happens
-            await this.page.waitForTimeout(1000); // Wait for potential dynamic updates
         } catch (e) {
-            console.error(`Failed to click ${selector}:`, e);
-            throw e;
+            // The element may be hidden behind a toggle (e.g. a collapsed menu).
+            // Try to reveal it by clicking a matching visible trigger, then retry.
+            console.warn(`Click failed for ${selector}; attempting to reveal hidden element...`);
+            const revealed = await this.tryReveal(selector);
+            if (!revealed) {
+                console.error(`Failed to click ${selector}:`, e);
+                throw e;
+            }
+            await this.page.click(selector, { timeout: 5000 });
         }
+
+        await this.page.waitForLoadState('domcontentloaded').catch(() => { }); // Catch if no nav happens
+        await this.page.waitForTimeout(1000); // Wait for potential dynamic updates
     }
 
     public async fillElement(selector: string, value: string) {
         if (!this.page) throw new Error("Browser not initialized.");
         console.log(`Filling element: ${selector} with "${value}"`);
 
+        let filled = false;
         try {
             await this.page.fill(selector, value, { timeout: 5000 });
-            await this.page.waitForTimeout(500); // Wait for potential validation/UI updates
+            filled = true;
         } catch (e) {
-            console.error(`Failed to fill ${selector}:`, e);
-            throw e;
+            // Hidden inputs (e.g. a collapsed search overlay) are a common pattern:
+            // click the visible toggle that reveals them, then retry.
+            console.warn(`Fill failed for ${selector}; attempting to reveal hidden element...`);
+            const revealed = await this.tryReveal(selector);
+            if (revealed) {
+                try {
+                    await this.page.fill(selector, value, { timeout: 5000 });
+                    filled = true;
+                } catch { /* fall through to force fill */ }
+            }
+            if (!filled) {
+                console.warn(`Retrying fill with force for ${selector}...`);
+                await this.page.fill(selector, value, { force: true, timeout: 5000 });
+                filled = true;
+            }
+        }
+
+        // Submit search inputs with Enter so the search actually runs even when
+        // the page has no separate (or not-yet-rendered) submit button.
+        if (filled && await this.isSearchInput(selector)) {
+            console.log(`Submitting search input with Enter: ${selector}`);
+            await this.page.press(selector, 'Enter', { timeout: 3000 }).catch((e) => {
+                console.warn(`Enter submit failed for ${selector}:`, e.message);
+            });
+        }
+
+        await this.page.waitForTimeout(500); // Wait for potential validation/UI updates
+    }
+
+    private async isSearchInput(selector: string): Promise<boolean> {
+        if (!this.page) return false;
+        try {
+            return await this.page.evaluate((sel: string) => {
+                const el = document.querySelector(sel) as HTMLInputElement | null;
+                if (!el || el.tagName.toLowerCase() !== 'input') return false;
+                const hint = `${el.getAttribute('type') || ''} ${el.getAttribute('placeholder') || ''} ${el.getAttribute('aria-label') || ''} ${el.getAttribute('name') || ''} ${typeof el.className === 'string' ? el.className : ''}`;
+                return /search/i.test(hint);
+            }, selector);
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Try to reveal a hidden element by clicking a visible trigger that shares a
+     * keyword with it (e.g. a "search" icon toggling a hidden search input).
+     * Returns true if the target is visible after the attempt.
+     */
+    private async tryReveal(selector: string): Promise<boolean> {
+        if (!this.page) return false;
+        try {
+            const marker = `data-agents-reveal-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+            const outcome = await this.page.evaluate((args: { sel: string; marker: string }) => {
+                const target = document.querySelector(args.sel);
+                if (!target) return 'missing';
+                const tStyle = window.getComputedStyle(target);
+                const tRect = target.getBoundingClientRect();
+                if (tStyle.display !== 'none' && tStyle.visibility !== 'hidden' && tStyle.opacity !== '0' && tRect.width > 0 && tRect.height > 0) return 'visible';
+
+                const ignored = ['type', 'input', 'button', 'header', 'form', 'wrap', 'group', 'row', 'inner', 'overlay', 'block', 'flex', 'container', 'wrapper', 'main', 'body', 'html', 'nth-of-type'];
+                const tokens: string[] = [];
+                const sources = [
+                    target.getAttribute('type'),
+                    target.getAttribute('placeholder'),
+                    target.getAttribute('aria-label'),
+                    target.getAttribute('name'),
+                    target.getAttribute('id'),
+                    typeof (target as HTMLElement).className === 'string' ? (target as HTMLElement).className : ''
+                ];
+                sources.forEach(v => {
+                    if (!v) return;
+                    v.toLowerCase().split(/[^a-z0-9]+/).forEach(t => {
+                        if (t.length >= 3 && ignored.indexOf(t) === -1 && tokens.indexOf(t) === -1) tokens.push(t);
+                    });
+                });
+
+                const candidates = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
+                let best: HTMLElement | null = null;
+                let bestScore = 0;
+                candidates.forEach(c => {
+                    const el = c as HTMLElement;
+                    const s = window.getComputedStyle(el);
+                    const r = el.getBoundingClientRect();
+                    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0' || r.width === 0 || r.height === 0) return;
+                    if (el === target || el.contains(target)) return;
+                    const hay = [el.getAttribute('aria-label'), el.getAttribute('title'), el.id, typeof el.className === 'string' ? el.className : '', el.innerText].filter(Boolean).join(' ').toLowerCase();
+                    let score = 0;
+                    // Match tokens at word boundaries so e.g. "enter" does not
+                    // match "align-items-center".
+                    tokens.forEach(t => { if (new RegExp('(^|[^a-z0-9])' + t).test(hay)) score++; });
+                    if (score > bestScore) { bestScore = score; best = el; }
+                });
+                if (!best || bestScore === 0) return 'no-trigger';
+                best.setAttribute(args.marker, '1');
+                return 'trigger';
+            }, { sel: selector, marker });
+
+            if (outcome === 'visible') return true;
+            if (outcome !== 'trigger') return false;
+
+            // Click with Playwright so the page receives a trusted event; some
+            // sites ignore synthetic el.click() for toggles.
+            const triggerSelector = `[${marker}="1"]`;
+            await this.page.click(triggerSelector, { timeout: 5000 });
+            await this.page.evaluate((m: string) => {
+                const el = document.querySelector(`[${m}="1"]`);
+                if (el) el.removeAttribute(m);
+            }, marker).catch(() => { });
+            await this.page.waitForTimeout(800);
+
+            const visible = await this.page.evaluate((sel: string) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                const s = window.getComputedStyle(el);
+                const r = el.getBoundingClientRect();
+                return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' && r.width > 0 && r.height > 0;
+            }, selector).catch(() => false);
+            return visible;
+        } catch (e) {
+            console.warn(`Reveal attempt failed for ${selector}:`, e);
+            return false;
+        }
+    }
+
+    public async countMatches(selector: string): Promise<number> {
+        if (!this.page) return 0;
+        try {
+            return await this.page.locator(selector).count();
+        } catch {
+            return 0;
         }
     }
 
@@ -128,42 +265,15 @@ class BrowserManager {
         // Evaluate extraction logic (Same as before)
         return await this.page.evaluate(() => {
             const results: any[] = [];
-            const isVisible = (el: Element) => {
-                const style = window.getComputedStyle(el);
-                return style.display !== 'none' &&
-                    style.visibility !== 'hidden' &&
-                    style.opacity !== '0' &&
-                    el.getBoundingClientRect().width > 0 &&
-                    el.getBoundingClientRect().height > 0;
-            };
-            const getCssSelector = (el: Element) => {
-                if (el.id) return `#${el.id}`;
-                let path: string[] = [];
-                while (el.nodeType === Node.ELEMENT_NODE) {
-                    let selector = el.nodeName.toLowerCase();
-                    if (el.id) {
-                        selector += '#' + el.id;
-                        path.unshift(selector);
-                        break;
-                    } else {
-                        let sib: Element | null = el;
-                        let nth = 1;
-                        while (sib = sib.previousElementSibling) {
-                            if (sib.nodeName.toLowerCase() == selector)
-                                nth++;
-                        }
-                        if (nth != 1)
-                            selector += ":nth-of-type(" + nth + ")";
-                    }
-                    path.unshift(selector);
-                    el = el.parentNode as Element;
-                }
-                return path.join(" > ");
-            };
 
             const candidates = document.querySelectorAll('a, button, input, textarea, [role="button"]');
             candidates.forEach((el) => {
-                if (!isVisible(el)) return;
+                const style = window.getComputedStyle(el);
+                if (style.display === 'none' ||
+                    style.visibility === 'hidden' ||
+                    style.opacity === '0' ||
+                    el.getBoundingClientRect().width === 0 ||
+                    el.getBoundingClientRect().height === 0) return;
 
                 let type = 'BUTTON'; // Default to BUTTON for candidates as they are likely interactive
                 const tagName = el.tagName.toLowerCase();
@@ -189,16 +299,49 @@ class BrowserManager {
                     text = (el as HTMLInputElement).value || el.getAttribute('value') || '';
                 }
 
-                let placeholder = el.getAttribute('placeholder') || null;
+                const placeholder = el.getAttribute('placeholder') || null;
                 const rect = el.getBoundingClientRect();
+
+                // Build CSS selector (inlined to avoid esbuild __name helpers leaking
+                // into the function that Playwright serializes into the page context)
+                let css: string;
+                if (el.id) {
+                    css = `#${el.id}`;
+                } else {
+                    const path: string[] = [];
+                    let node: Element | null = el;
+                    while (node && node.nodeType === Node.ELEMENT_NODE) {
+                        let selector = node.nodeName.toLowerCase();
+                        if (node.id) {
+                            selector += '#' + node.id;
+                            path.unshift(selector);
+                            break;
+                        } else {
+                            let sib: Element | null = node;
+                            let nth = 1;
+                            while (sib = sib.previousElementSibling) {
+                                if (sib.nodeName.toLowerCase() == selector)
+                                    nth++;
+                            }
+                            if (nth != 1)
+                                selector += ":nth-of-type(" + nth + ")";
+                        }
+                        path.unshift(selector);
+                        node = node.parentNode as Element;
+                    }
+                    css = path.join(" > ");
+                }
 
                 results.push({
                     type,
                     content: { text: text.substring(0, 100).trim(), placeholder },
-                    selectors: { css: getCssSelector(el), id: el.id || null },
+                    selectors: { css, id: el.id || null },
                     attributes: {
                         href: el.getAttribute('href') || null,
-                        src: el.getAttribute('src') || null
+                        src: el.getAttribute('src') || null,
+                        ariaLabel: el.getAttribute('aria-label') || null,
+                        title: el.getAttribute('title') || null,
+                        className: typeof (el as HTMLElement).className === 'string' ? ((el as HTMLElement).className || null) : null
                     },
                     geometry: {
                         x: Math.round(rect.x + window.scrollX),
