@@ -9,13 +9,14 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Send, Loader2, CheckCircle2, XCircle, Info, Settings, Play, Brain, Sparkles, RefreshCw, Cpu } from "lucide-react";
+import { Send, Loader2, CheckCircle2, XCircle, Info, Settings, Play, Brain, Sparkles, RefreshCw, Cpu, Square, Camera, Globe, Search, ExternalLink, Power, MessageSquare, Plus, Trash2, AlertTriangle } from "lucide-react";
 import LiveStreamPanel, { emptyStreamState, StreamState } from "@/components/LiveStreamPanel";
 import LiveActivityPanel from "@/components/LiveActivityPanel";
 import type { StreamEvent } from "@/shared/streaming";
 
 interface AgentResponse {
   success: boolean;
+  stopped?: boolean;
   data?: {
     recognizedIntent?: {
       intent: string;
@@ -51,8 +52,23 @@ interface AgentResponse {
     requiresClarification?: boolean;
     clarificationQuestions?: string[];
     finalResponse?: string;
+    /** Screenshots of the final page that were shown to a vision model. */
+    screenshots?: string[];
   };
   error?: string;
+}
+
+interface ChatTurn {
+  input: string;
+  response: AgentResponse;
+  timestamp: number;
+}
+
+interface Chat {
+  id: string;
+  title: string;
+  createdAt: number;
+  turns: ChatTurn[];
 }
 
 export default function AgentsPage() {
@@ -61,14 +77,26 @@ export default function AgentsPage() {
   const [isLoading, setIsLoading] = useState(false);
   const [response, setResponse] = useState<AgentResponse | null>(null);
   const [primaryAgentUrl, setPrimaryAgentUrl] = useState("http://localhost:3001");
-  const [history, setHistory] = useState<Array<{ input: string; response: AgentResponse; timestamp: Date }>>([]);
+  const [chats, setChats] = useState<Chat[]>([]);
+  const [activeChatId, setActiveChatId] = useState("");
+  const [captchaNotice, setCaptchaNotice] = useState<{ active: boolean; message: string } | null>(null);
   const [stream, setStream] = useState<StreamState>(emptyStreamState());
   const [models, setModels] = useState<string[]>([]);
   const [defaultModel, setDefaultModel] = useState("");
   const [selectedModel, setSelectedModel] = useState("");
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsError, setModelsError] = useState<string | null>(null);
+  const [loadedModel, setLoadedModel] = useState<string | null>(null);
+  const [loadedModels, setLoadedModels] = useState<string[]>([]);
+  const [visionModels, setVisionModels] = useState<string[]>([]);
+  const [browserUrl, setBrowserUrl] = useState("");
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browserTitle, setBrowserTitle] = useState("");
+  const [browserBusy, setBrowserBusy] = useState(false);
+  const [browserMessage, setBrowserMessage] = useState<string | null>(null);
   const modelsRequestId = useRef(0);
+  const streamAbortRef = useRef<AbortController | null>(null);
+  const stopRequestedRef = useRef(false);
 
   const loadModels = async (agentUrl: string) => {
     const requestId = ++modelsRequestId.current;
@@ -84,6 +112,9 @@ export default function AgentsPage() {
       const nextModels: string[] = payload.models || [];
       setModels(nextModels);
       setDefaultModel(payload.defaultModel || "");
+      setLoadedModel(payload.loadedModel || null);
+      setLoadedModels(payload.loadedModels || []);
+      setVisionModels(payload.visionModels || []);
       // Drop a saved selection that no longer exists in LM Studio.
       setSelectedModel((current) => {
         if (current && !nextModels.includes(current)) {
@@ -96,6 +127,9 @@ export default function AgentsPage() {
       if (requestId !== modelsRequestId.current) return; // stale response
       setModels([]);
       setDefaultModel("");
+      setLoadedModel(null);
+      setLoadedModels([]);
+      setVisionModels([]);
       setModelsError(error.message || "Failed to load models");
     } finally {
       if (requestId === modelsRequestId.current) setModelsLoading(false);
@@ -122,13 +156,198 @@ export default function AgentsPage() {
     }
   };
 
+  // --- Chats (independent conversation histories) -------------------------
+
+  const activeChat = chats.find((c) => c.id === activeChatId) || null;
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const saved = window.localStorage.getItem("agent-chats");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setChats(parsed);
+          const savedActive = window.localStorage.getItem("agent-active-chat");
+          const active = parsed.some((c: Chat) => c.id === savedActive) ? savedActive! : parsed[0].id;
+          setActiveChatId(active);
+          const chat = parsed.find((c: Chat) => c.id === active);
+          if (chat && chat.turns.length > 0) setResponse(chat.turns[0].response);
+          return;
+        }
+      }
+    } catch {
+      // ignore corrupt storage and start fresh
+    }
+    const fresh: Chat = { id: `chat_${Date.now()}`, title: "New chat", createdAt: Date.now(), turns: [] };
+    setChats([fresh]);
+    setActiveChatId(fresh.id);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || chats.length === 0) return;
+    try {
+      // Never persist screenshots (hundreds of KB each) — they would blow the
+      // localStorage quota after a few turns. They stay in memory for the
+      // current session.
+      const serializable = chats.map((chat) => ({
+        ...chat,
+        turns: chat.turns.map((turn) => {
+          const shots = turn.response.data?.screenshots;
+          if (!shots || shots.length === 0) return turn;
+          return {
+            ...turn,
+            response: {
+              ...turn.response,
+              data: { ...turn.response.data, screenshots: undefined },
+            },
+          };
+        }),
+      }));
+      window.localStorage.setItem("agent-chats", JSON.stringify(serializable));
+    } catch {
+      // storage full/unavailable — chats still work in memory
+    }
+  }, [chats]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !activeChatId) return;
+    window.localStorage.setItem("agent-active-chat", activeChatId);
+  }, [activeChatId]);
+
+  const selectChat = (id: string) => {
+    setActiveChatId(id);
+    const chat = chats.find((c) => c.id === id);
+    setResponse(chat && chat.turns.length > 0 ? chat.turns[0].response : null);
+    setStream(emptyStreamState());
+    setCaptchaNotice(null);
+    stopRequestedRef.current = false;
+  };
+
+  const createChat = () => {
+    const fresh: Chat = { id: `chat_${Date.now()}`, title: "New chat", createdAt: Date.now(), turns: [] };
+    setChats((prev) => [fresh, ...prev]);
+    setActiveChatId(fresh.id);
+    setResponse(null);
+    setStream(emptyStreamState());
+    setCaptchaNotice(null);
+    setUserInput("");
+  };
+
+  const deleteActiveChat = () => {
+    const remaining = chats.filter((c) => c.id !== activeChatId);
+    const next = remaining.length > 0
+      ? remaining
+      : [{ id: `chat_${Date.now()}`, title: "New chat", createdAt: Date.now(), turns: [] }];
+    setChats(next);
+    setActiveChatId(next[0].id);
+    setResponse(next[0].turns.length > 0 ? next[0].turns[0].response : null);
+    setStream(emptyStreamState());
+    setCaptchaNotice(null);
+  };
+
+  const handleResume = async () => {
+    try {
+      await fetch(`${primaryAgentUrl}/resume`, { method: "POST" });
+      setCaptchaNotice((prev) => (prev ? { ...prev, active: false, message: "Continuing..." } : prev));
+    } catch {
+      // the captcha polling will pick it up anyway
+    }
+  };
+
+  const handleStopExecution = () => {
+    stopRequestedRef.current = true;
+    // Stop the server-side pipeline first (it also forwards to the secondary
+    // agent so browser actions halt), then cut the local SSE connection.
+    fetch(`${primaryAgentUrl}/stop`, { method: "POST" }).catch(() => {});
+    streamAbortRef.current?.abort();
+    setIsLoading(false);
+    setResponse({ success: false, stopped: true, error: "Execution stopped by user" });
+  };
+
+  const refreshBrowserStatus = async (prefill = false) => {
+    try {
+      const res = await fetch(`${primaryAgentUrl}/browser/status`);
+      const payload = await res.json().catch(() => ({}));
+      if (!payload.success) return;
+      setBrowserOpen(!!payload.open);
+      setBrowserTitle(payload.title || "");
+      // Prefill the URL field with the page the browser is on (only on first load,
+      // so it never overwrites what the user is typing).
+      if (prefill && payload.url && payload.url !== "about:blank") {
+        setBrowserUrl(payload.url);
+      }
+    } catch {
+      // secondary agent not reachable — leave the last known status
+    }
+  };
+
+  useEffect(() => {
+    refreshBrowserStatus(true);
+    const timer = setInterval(() => refreshBrowserStatus(false), 15000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [primaryAgentUrl]);
+
+  const handleBrowserNavigate = async (mode: "url" | "search") => {
+    const value = browserUrl.trim();
+    if (!value || browserBusy) return;
+    setBrowserBusy(true);
+    setBrowserMessage(null);
+    try {
+      const res = await fetch(`${primaryAgentUrl}/navigate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(mode === "search" ? { query: value } : { url: value }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok || !payload.success) {
+        throw new Error(payload.error || `HTTP ${res.status}`);
+      }
+      setBrowserOpen(true);
+      setBrowserTitle(payload.title || "");
+      if (payload.url) setBrowserUrl(payload.url);
+      setBrowserMessage(`Loaded: ${payload.title || payload.url}`);
+    } catch (error: any) {
+      setBrowserMessage(`Failed: ${error.message || "navigation failed"}`);
+    } finally {
+      setBrowserBusy(false);
+    }
+  };
+
+  const handleOpenBrowser = async () => {
+    if (browserBusy) return;
+    setBrowserBusy(true);
+    setBrowserMessage(null);
+    try {
+      const res = await fetch(`${primaryAgentUrl}/browser/open`, { method: "POST" });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok || !payload.success) {
+        throw new Error(payload.error || `HTTP ${res.status}`);
+      }
+      setBrowserOpen(true);
+      if (payload.url && payload.url !== "about:blank") setBrowserUrl(payload.url);
+      setBrowserMessage("Browser window opened");
+    } catch (error: any) {
+      setBrowserMessage(`Failed: ${error.message || "could not open browser"}`);
+    } finally {
+      setBrowserBusy(false);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!userInput.trim() || isLoading) return;
 
+    stopRequestedRef.current = false;
     setIsLoading(true);
     setResponse(null);
     setStream(emptyStreamState());
+    setCaptchaNotice(null);
+
+    const abortController = new AbortController();
+    streamAbortRef.current = abortController;
+    const chatIdForRequest = activeChatId;
 
     const applyEvent = (event: StreamEvent) => {
       setStream((prev) => {
@@ -179,6 +398,20 @@ export default function AgentsPage() {
 
         return next;
       });
+
+      // Out-of-band notices (CAPTCHA appeared / solved) are handled outside the
+      // stream state so they render as a banner.
+      if (event.type === "notice") {
+        const kind = event.noticeKind;
+        const message = event.text || "";
+        if (kind === "captcha") {
+          setCaptchaNotice({ active: true, message: message || "A bot check appeared. Solve it in the browser window." });
+        } else if (kind === "captcha_cleared") {
+          setCaptchaNotice({ active: false, message: message || "Bot check solved — continuing." });
+        } else if (kind === "captcha_timeout") {
+          setCaptchaNotice({ active: false, message: message || "The bot check was not solved in time." });
+        }
+      }
     };
 
     try {
@@ -187,9 +420,11 @@ export default function AgentsPage() {
         headers: {
           "Content-Type": "application/json",
         },
+        signal: abortController.signal,
         body: JSON.stringify({
           userInput: userInput.trim(),
           autoExecute,
+          chatId: chatIdForRequest,
           ...((selectedModel || defaultModel)
             ? {
                 config: { model: selectedModel || defaultModel },
@@ -247,20 +482,37 @@ export default function AgentsPage() {
         setResponse({ success: false, error: streamError });
       } else if (finalData) {
         setResponse(finalData);
-        setHistory((prev) => [
-          { input: userInput, response: finalData, timestamp: new Date() },
-          ...prev.slice(0, 9), // Keep last 10 items
-        ]);
+        const turn: ChatTurn = { input: userInput, response: finalData, timestamp: Date.now() };
+        setChats((prev) =>
+          prev.map((chat) =>
+            chat.id === chatIdForRequest
+              ? {
+                  ...chat,
+                  title: chat.turns.length === 0 ? userInput.trim().slice(0, 40) : chat.title,
+                  turns: [turn, ...chat.turns].slice(0, 20),
+                }
+              : chat
+          )
+        );
         setUserInput(""); // Clear input after successful submission
       } else {
         setResponse({ success: false, error: "Stream ended without a result" });
       }
     } catch (error: any) {
-      setResponse({
-        success: false,
-        error: error.message || "An error occurred",
-      });
+      if (stopRequestedRef.current) {
+        setResponse({
+          success: false,
+          stopped: true,
+          error: "Execution stopped by user",
+        });
+      } else {
+        setResponse({
+          success: false,
+          error: error.message || "An error occurred",
+        });
+      }
     } finally {
+      streamAbortRef.current = null;
       setIsLoading(false);
     }
   };
@@ -272,8 +524,12 @@ export default function AgentsPage() {
         headers: {
           "Content-Type": "application/json",
         },
+        body: JSON.stringify({ chatId: activeChatId }),
       });
-      setHistory([]);
+      setChats((prev) =>
+        prev.map((chat) => (chat.id === activeChatId ? { ...chat, turns: [] } : chat))
+      );
+      setResponse(null);
     } catch (error) {
       console.error("Failed to clear history:", error);
     }
@@ -339,6 +595,7 @@ export default function AgentsPage() {
                 {models.map((m) => (
                   <option key={m} value={m}>
                     {m}
+                    {loadedModels.includes(m) ? " (loaded)" : ""}
                   </option>
                 ))}
               </select>
@@ -353,6 +610,20 @@ export default function AgentsPage() {
                 <RefreshCw className={`w-4 h-4 ${modelsLoading ? "animate-spin" : ""}`} />
               </Button>
             </div>
+            {loadedModel ? (
+              <div className="flex items-center gap-4">
+                <Label className="text-zinc-300 w-32">Currently loaded:</Label>
+                <div className="flex-1 flex items-center gap-2">
+                  <span className="text-green-300 font-mono text-sm">{loadedModel}</span>
+                  {visionModels.includes(loadedModel) && (
+                    <Badge className="bg-purple-600">
+                      <Camera className="w-3 h-3 mr-1" />
+                      Vision
+                    </Badge>
+                  )}
+                </div>
+              </div>
+            ) : null}
             {modelsError ? (
               <p className="text-xs text-red-400 pl-36">
                 Could not list LM Studio models: {modelsError}
@@ -360,6 +631,7 @@ export default function AgentsPage() {
             ) : models.length > 0 ? (
               <p className="text-xs text-zinc-500 pl-36">
                 {models.length} model{models.length === 1 ? "" : "s"} available in LM Studio
+                {visionModels.length > 0 ? ` (${visionModels.length} vision-capable)` : ""}
               </p>
             ) : null}
             <div className="flex items-center gap-4">
@@ -372,15 +644,86 @@ export default function AgentsPage() {
                 onCheckedChange={setAutoExecute}
               />
             </div>
-            {history.length > 0 && (
+            {(activeChat?.turns.length ?? 0) > 0 && (
               <Button
                 onClick={clearHistory}
                 variant="outline"
                 className="w-full border-zinc-600 text-zinc-300 hover:bg-zinc-700"
               >
-                Clear History
+                Clear This Chat
               </Button>
             )}
+          </CardContent>
+        </Card>
+
+        {/* Browser Card */}
+        <Card className="mb-6 bg-zinc-800/50 border-zinc-700">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-white">
+              <Globe className="w-5 h-5" />
+              Browser
+              <Badge className={browserOpen ? "bg-green-600 ml-1" : "bg-zinc-600 ml-1"}>
+                {browserOpen ? "Open" : "Closed"}
+              </Badge>
+            </CardTitle>
+            <CardDescription className="text-zinc-400">
+              Go to a URL or search the web directly. The browser reopens automatically if its window was closed.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <div className="flex items-center gap-2">
+              <Input
+                value={browserUrl}
+                onChange={(e) => setBrowserUrl(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    handleBrowserNavigate("url");
+                  }
+                }}
+                placeholder="https://example.com — or type a search query"
+                className="flex-1 bg-zinc-700 border-zinc-600 text-white"
+                disabled={browserBusy}
+              />
+              <Button
+                type="button"
+                onClick={() => handleBrowserNavigate("url")}
+                disabled={browserBusy || !browserUrl.trim()}
+                className="bg-blue-600 hover:bg-blue-700 text-white"
+                title="Navigate to this URL"
+              >
+                {browserBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ExternalLink className="w-4 h-4" />}
+                <span className="ml-2">Go</span>
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => handleBrowserNavigate("search")}
+                disabled={browserBusy || !browserUrl.trim()}
+                className="border-zinc-600 text-zinc-300 hover:bg-zinc-700"
+                title="Search DuckDuckGo for this text"
+              >
+                <Search className="w-4 h-4" />
+                <span className="ml-2">Search</span>
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={handleOpenBrowser}
+                disabled={browserBusy}
+                className="border-zinc-600 text-zinc-300 hover:bg-zinc-700"
+                title="Open a browser window if none is running"
+              >
+                <Power className="w-4 h-4" />
+              </Button>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-zinc-400 min-h-[16px]">
+              <span>Current page:</span>
+              <span className="font-mono text-zinc-300 truncate max-w-[60%]">
+                {browserTitle || browserUrl || "—"}
+              </span>
+              {browserMessage && <span className="text-zinc-500 truncate">· {browserMessage}</span>}
+            </div>
           </CardContent>
         </Card>
 
@@ -398,6 +741,42 @@ export default function AgentsPage() {
             </CardHeader>
             <CardContent>
               <form onSubmit={handleSubmit} className="space-y-4">
+                <div className="flex items-center gap-2">
+                  <MessageSquare className="w-4 h-4 text-zinc-400 shrink-0" />
+                  <select
+                    value={activeChatId}
+                    onChange={(e) => selectChat(e.target.value)}
+                    disabled={isLoading}
+                    className="flex-1 min-w-0 bg-zinc-700 border border-zinc-600 text-white rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                    title="Switch chat — each chat has its own conversation history"
+                  >
+                    {chats.map((chat) => (
+                      <option key={chat.id} value={chat.id}>
+                        {chat.title} ({chat.turns.length})
+                      </option>
+                    ))}
+                  </select>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={createChat}
+                    disabled={isLoading}
+                    className="border-zinc-600 text-zinc-300 hover:bg-zinc-700"
+                    title="Start a new chat"
+                  >
+                    <Plus className="w-4 h-4" />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={deleteActiveChat}
+                    disabled={isLoading || chats.length <= 1}
+                    className="border-zinc-600 text-zinc-300 hover:bg-zinc-700"
+                    title="Delete this chat"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </Button>
+                </div>
                 <div>
                   <textarea
                     value={userInput}
@@ -424,6 +803,16 @@ export default function AgentsPage() {
                     </>
                   )}
                 </Button>
+                {isLoading && (
+                  <Button
+                    type="button"
+                    onClick={handleStopExecution}
+                    className="w-full bg-red-600 hover:bg-red-700 text-white"
+                  >
+                    <Square className="w-4 h-4 mr-2" />
+                    Stop Execution
+                  </Button>
+                )}
               </form>
             </CardContent>
           </Card>
@@ -434,6 +823,8 @@ export default function AgentsPage() {
               <CardTitle className="text-white flex items-center gap-2">
                 {response?.success ? (
                   <CheckCircle2 className="w-5 h-5 text-green-400" />
+                ) : response?.stopped ? (
+                  <Square className="w-5 h-5 text-red-400" />
                 ) : response ? (
                   <XCircle className="w-5 h-5 text-red-400" />
                 ) : (
@@ -443,6 +834,43 @@ export default function AgentsPage() {
               </CardTitle>
             </CardHeader>
             <CardContent>
+              {captchaNotice && (
+                <div
+                  className={`mb-4 rounded-md border p-3 ${
+                    captchaNotice.active
+                      ? "border-amber-600 bg-amber-900/30"
+                      : "border-zinc-600 bg-zinc-700/40"
+                  }`}
+                >
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle
+                      className={`w-5 h-5 shrink-0 ${captchaNotice.active ? "text-amber-400" : "text-zinc-400"}`}
+                    />
+                    <div className="flex-1">
+                      <p className="text-sm text-zinc-100">{captchaNotice.message}</p>
+                      {captchaNotice.active && (
+                        <div className="mt-2 flex gap-2">
+                          <Button
+                            type="button"
+                            onClick={handleResume}
+                            className="bg-amber-600 hover:bg-amber-700 text-white"
+                          >
+                            Continue
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => setCaptchaNotice(null)}
+                            className="border-zinc-600 text-zinc-300 hover:bg-zinc-700"
+                          >
+                            Dismiss
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
               {isLoading ? (
                 <LiveStreamPanel stream={stream} />
               ) : !response ? (
@@ -451,7 +879,9 @@ export default function AgentsPage() {
                 </p>
               ) : response.error ? (
                 <div className="space-y-2">
-                  <p className="text-red-400 font-semibold">Error:</p>
+                  <p className={response.stopped ? "text-red-400 font-semibold" : "text-red-400 font-semibold"}>
+                    {response.stopped ? "Stopped:" : "Error:"}
+                  </p>
                   <p className="text-red-300">{response.error}</p>
                 </div>
               ) : (
@@ -465,6 +895,24 @@ export default function AgentsPage() {
                       <p className="text-zinc-100 whitespace-pre-wrap leading-relaxed">
                         {response.data.finalResponse}
                       </p>
+                      {response.data.screenshots && response.data.screenshots.length > 0 && (
+                        <div className="mt-3">
+                          <p className="text-xs text-zinc-400 mb-1">
+                            Page screenshots shown to the model ({response.data.screenshots.length}):
+                          </p>
+                          <div className="flex gap-2 overflow-x-auto pb-1">
+                            {response.data.screenshots.map((shot, idx) => (
+                              <a key={idx} href={shot} target="_blank" rel="noreferrer" className="shrink-0">
+                                <img
+                                  src={shot}
+                                  alt={`Page screenshot ${idx + 1}`}
+                                  className="h-24 rounded border border-zinc-600 hover:border-blue-400"
+                                />
+                              </a>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                   <Tabs defaultValue="intent" className="w-full">
@@ -651,24 +1099,34 @@ export default function AgentsPage() {
           <LiveActivityPanel url={primaryAgentUrl} />
         </div>
 
-        {/* History */}
-        {history.length > 0 && (
+        {/* History for the active chat */}
+        {(activeChat?.turns.length ?? 0) > 0 && (
           <Card className="mt-6 bg-zinc-800/50 border-zinc-700">
             <CardHeader>
-              <CardTitle className="text-white">Recent History</CardTitle>
-              <CardDescription className="text-zinc-400">Last 10 interactions</CardDescription>
+              <CardTitle className="text-white flex items-center gap-2">
+                <MessageSquare className="w-5 h-5" />
+                {activeChat?.title || "Chat"}
+              </CardTitle>
+              <CardDescription className="text-zinc-400">
+                {activeChat?.turns.length} interaction{(activeChat?.turns.length ?? 0) === 1 ? "" : "s"} in this chat
+              </CardDescription>
             </CardHeader>
             <CardContent>
               <ScrollArea className="h-[200px]">
                 <div className="space-y-2">
-                  {history.map((item, idx) => (
+                  {activeChat?.turns.map((item, idx) => (
                     <Card key={idx} className="bg-zinc-700/50 border-zinc-600">
                       <CardContent className="p-3">
-                        <div className="flex items-start justify-between">
-                          <div className="flex-1">
-                            <p className="text-white text-sm font-medium">{item.input}</p>
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex-1 min-w-0">
+                            <p className="text-white text-sm font-medium truncate">{item.input}</p>
+                            {item.response.data?.finalResponse && (
+                              <p className="text-zinc-300 text-xs mt-1 line-clamp-2">
+                                {item.response.data.finalResponse}
+                              </p>
+                            )}
                             <p className="text-zinc-400 text-xs mt-1">
-                              {item.timestamp.toLocaleTimeString()} - Intent: {item.response.data?.recognizedIntent?.intent || "N/A"}
+                              {new Date(item.timestamp).toLocaleTimeString()} - Intent: {item.response.data?.recognizedIntent?.intent || "N/A"}
                             </p>
                           </div>
                           <Badge className={item.response.success ? "bg-green-600" : "bg-red-600"}>

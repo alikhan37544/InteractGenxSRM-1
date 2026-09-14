@@ -7,7 +7,8 @@ export type StreamPhase =
     | 'instruction_generation'
     | 'execution'
     | 'selector_resolution'
-    | 'response_synthesis';
+    | 'response_synthesis'
+    | 'judging';
 
 export const PHASE_LABELS: Record<StreamPhase, string> = {
     intent_recognition: 'Understanding intent',
@@ -15,14 +16,17 @@ export const PHASE_LABELS: Record<StreamPhase, string> = {
     execution: 'Executing actions',
     selector_resolution: 'Resolving element selector',
     response_synthesis: 'Composing answer',
+    judging: 'Checking answer completeness',
 };
 
 export interface StreamEvent {
-    type: 'phase' | 'token' | 'thinking' | 'done' | 'error';
+    type: 'phase' | 'token' | 'thinking' | 'done' | 'error' | 'notice';
     phase?: StreamPhase;
     status?: 'started' | 'done';
     label?: string;
     text?: string;
+    /** For `notice` events: what the notice is about (e.g. "captcha"). */
+    noticeKind?: string;
     tokens?: number;
     tokensPerSec?: number;
     etaMs?: number;
@@ -41,6 +45,8 @@ export interface AgentStreamHooks {
     /** Reasoning/thinking tokens emitted by the model before its answer. */
     onThinking?: (phase: StreamPhase, text: string) => void;
     onPhaseEnd?: (phase: StreamPhase) => void;
+    /** Out-of-band notice (e.g. a CAPTCHA appearing or being solved). */
+    onNotice?: (kind: string, message: string, data?: any) => void;
 }
 
 // Seed estimates (tokens) used before enough real samples have been collected.
@@ -50,6 +56,7 @@ const DEFAULT_EXPECTED_TOKENS: Record<StreamPhase, number> = {
     execution: 0,
     selector_resolution: 120,
     response_synthesis: 260,
+    judging: 140,
 };
 
 // Fallback generation rate (tokens/sec) used before any tokens have arrived.
@@ -212,6 +219,11 @@ export class StreamSession {
     /** Re-emit an event received from another agent (used when relaying streams). */
     forward(event: StreamEvent): void {
         this.emit(event);
+    }
+
+    /** Out-of-band notice (CAPTCHA appeared/solved, etc.). */
+    notice(kind: string, message: string, data?: any): void {
+        this.emit({ type: 'notice', noticeKind: kind, text: message, data, timestamp: Date.now() });
     }
 
     done(data: any): void {

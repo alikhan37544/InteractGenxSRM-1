@@ -3,6 +3,7 @@
 
 import OpenAI from 'openai';
 import { UserIntent, IntentEntity } from '../shared/types';
+import { isStopError, StopError, throwIfAborted } from '../shared/stop';
 import { IntentRecognitionResult } from './types';
 
 const openai = new OpenAI({
@@ -23,7 +24,8 @@ export class IntentRecognizer {
         userInput: string,
         conversationHistory?: Array<{role: string, content: string}>,
         onToken?: (text: string) => void,
-        onThinking?: (text: string) => void
+        onThinking?: (text: string) => void,
+        signal?: AbortSignal
     ): Promise<IntentRecognitionResult> {
         const systemPrompt = `You are an expert intent recognition system. Your job is to understand what the user wants to do on a website.
 
@@ -64,6 +66,8 @@ ${conversationHistory ? `\nConversation history:\n${conversationHistory.map(msg 
 Analyze this input and extract the intent, entities, and context.`;
 
         try {
+            throwIfAborted(signal);
+
             const messages: any[] = [
                 { role: 'system', content: systemPrompt },
                 { role: 'user', content: userPrompt }
@@ -82,9 +86,10 @@ Analyze this input and extract the intent, entities, and context.`;
                     messages,
                     temperature: this.temperature,
                     stream: true
-                });
+                }, { signal });
                 content = '';
                 for await (const chunk of stream) {
+                    throwIfAborted(signal);
                     const delta = chunk.choices[0]?.delta?.content || '';
                     const reasoning = (chunk.choices[0]?.delta as any)?.reasoning_content || '';
                     if (reasoning) {
@@ -100,7 +105,7 @@ Analyze this input and extract the intent, entities, and context.`;
                     model: this.model,
                     messages,
                     temperature: this.temperature
-                });
+                }, { signal });
                 content = completion.choices[0].message.content || '';
             }
 
@@ -139,6 +144,10 @@ Analyze this input and extract the intent, entities, and context.`;
             };
 
         } catch (error) {
+            // A user-initiated stop must propagate, not fall back to heuristics.
+            if (isStopError(error) || signal?.aborted) {
+                throw error instanceof StopError ? error : new StopError();
+            }
             console.error('Intent recognition error:', error);
             // Fallback to basic intent recognition
             return {

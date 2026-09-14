@@ -32,5 +32,9 @@ export interface SecondaryAgentResponse {
     success: boolean;
     message: string;
     errors?: string[];
+    /** True when the run was aborted by a stop request before finishing. */
+    stopped?: boolean;
+    /** True when the run hit an unsolved CAPTCHA / bot check. */
+    captcha?: boolean;
 }
 

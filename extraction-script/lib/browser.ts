@@ -7,6 +7,7 @@ class BrowserManager {
     private context: BrowserContext | null = null;
     private page: Page | null = null;
     private isInitialized = false;
+    private lastHeadless = true;
 
     private constructor() { }
 
@@ -18,7 +19,20 @@ class BrowserManager {
     }
 
     public async init(headless: boolean = true) {
-        if (this.isInitialized && this.browser) return;
+        this.lastHeadless = headless;
+
+        // Reuse the running browser only if it is genuinely still alive. A
+        // window closed by the user leaves stale handles behind (browser
+        // disconnected / page closed), so relaunch instead of failing later.
+        if (this.isInitialized && this.isActive()) return;
+
+        if (this.browser || this.isInitialized) {
+            console.log("Previous browser session is gone; launching a new browser.");
+        }
+        this.browser = null;
+        this.context = null;
+        this.page = null;
+        this.isInitialized = false;
 
         this.browser = await chromium.launch({ headless });
         this.context = await this.browser.newContext();
@@ -29,7 +43,23 @@ class BrowserManager {
     }
 
     public isActive() {
-        return !!this.page && !this.page.isClosed();
+        return !!this.page && !this.page.isClosed() && !!this.browser && this.browser.isConnected();
+    }
+
+    /**
+     * URL + title of the current page, or null when no browser is open.
+     * Never launches a browser (safe to poll for status).
+     */
+    public async getPageInfo(): Promise<{ url: string; title: string } | null> {
+        if (!this.isActive()) return null;
+        try {
+            return {
+                url: this.page!.url(),
+                title: await this.page!.title()
+            };
+        } catch {
+            return null;
+        }
     }
 
     public async navigate(url: string) {
@@ -48,6 +78,10 @@ class BrowserManager {
     public async clickElement(selector: string) {
         if (!this.page) throw new Error("Browser not initialized.");
         console.log(`Clicking element: ${selector}`);
+
+        const context = this.page.context();
+        const pagesBefore = new Set(context.pages());
+        const urlBefore = this.page.url();
 
         try {
             await this.page.click(selector, { timeout: 5000 });
@@ -72,6 +106,20 @@ class BrowserManager {
 
         await this.page.waitForLoadState('domcontentloaded').catch(() => { }); // Catch if no nav happens
         await this.page.waitForTimeout(1000); // Wait for potential dynamic updates
+
+        // A link with target="_blank" opens a new tab and leaves the current
+        // page untouched. Follow the new tab so "click a result" still counts
+        // as navigation instead of silently doing nothing.
+        if (this.page.url() === urlBefore) {
+            const newPage = context.pages().filter(p => !pagesBefore.has(p));
+            const next = newPage[newPage.length - 1];
+            if (next) {
+                console.log("Click opened a new tab; switching to it.");
+                await next.waitForLoadState('domcontentloaded').catch(() => { });
+                await next.waitForTimeout(500).catch(() => { });
+                this.page = next;
+            }
+        }
     }
 
     /**
@@ -522,9 +570,81 @@ class BrowserManager {
             return {
                 url: window.location.href,
                 title: document.title,
+                // Visible page text (normalized) so the agent can actually read
+                // the page, not just its interactive elements. Truncated to keep
+                // prompts within a reasonable token budget.
+                text: ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 10000),
                 elements: results
             };
         });
+    }
+
+    /**
+     * Capture a screenshot of the current page as a base64 PNG data URL.
+     * Returns null when the browser is not initialized or the shot fails.
+     */
+    public async takeScreenshot(): Promise<string | null> {
+        if (!this.page || this.page.isClosed()) return null;
+        try {
+            const buffer = await this.page.screenshot({ type: 'png' });
+            return `data:image/png;base64,${buffer.toString('base64')}`;
+        } catch (error) {
+            console.warn('Screenshot failed:', error);
+            return null;
+        }
+    }
+
+    /**
+     * Lightweight page signature (url/title/leading text) without extracting
+     * elements — used for polling (e.g. waiting for a CAPTCHA to be solved).
+     */
+    public async getPageSummary(): Promise<{ url: string; title: string; text: string } | null> {
+        if (!this.isActive()) return null;
+        try {
+            return await this.page!.evaluate(() => ({
+                url: window.location.href,
+                title: document.title,
+                text: ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim().slice(0, 2000)
+            }));
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Capture up to `max` viewport screenshots while scrolling from the top of
+     * the page to the bottom, so a vision model can see the whole page. Images
+     * are JPEG to keep the payload small. The scroll position is restored.
+     */
+    public async takeScreenshots(max: number = 4): Promise<string[]> {
+        if (!this.isActive()) return [];
+        const shots: string[] = [];
+        let originalY = 0;
+        try {
+            originalY = await this.page!.evaluate(() => window.scrollY).catch(() => 0);
+            await this.page!.evaluate(() => window.scrollTo(0, 0)).catch(() => { });
+            await this.page!.waitForTimeout(350);
+
+            for (let i = 0; i < max; i++) {
+                const buffer = await this.page!.screenshot({ type: 'jpeg', quality: 70 });
+                shots.push(`data:image/jpeg;base64,${buffer.toString('base64')}`);
+
+                const atBottom = await this.page!.evaluate(() =>
+                    (window.scrollY + window.innerHeight) >= (document.body.scrollHeight - 20)
+                ).catch(() => true);
+                if (atBottom) break;
+
+                await this.page!.evaluate(() => window.scrollBy(0, Math.round(window.innerHeight * 0.9))).catch(() => { });
+                await this.page!.waitForTimeout(450);
+            }
+        } catch (error) {
+            console.warn('Multi-screenshot failed:', error);
+        } finally {
+            if (this.page && !this.page.isClosed()) {
+                await this.page.evaluate((y: number) => window.scrollTo(0, y), originalY).catch(() => { });
+            }
+        }
+        return shots;
     }
 
     public async scrollPage(direction: 'up' | 'down' | 'top' | 'bottom') {

@@ -18,11 +18,13 @@ export const PHASE_LABELS: Record<StreamPhase, string> = {
 };
 
 export interface StreamEvent {
-    type: 'phase' | 'token' | 'thinking' | 'done' | 'error';
+    type: 'phase' | 'token' | 'thinking' | 'done' | 'error' | 'notice';
     phase?: StreamPhase;
     status?: 'started' | 'done';
     label?: string;
     text?: string;
+    /** For `notice` events: what the notice is about (e.g. "captcha"). */
+    noticeKind?: string;
     tokens?: number;
     tokensPerSec?: number;
     etaMs?: number;
@@ -41,6 +43,8 @@ export interface AgentStreamHooks {
     /** Reasoning/thinking tokens emitted by the model before its answer. */
     onThinking?: (phase: StreamPhase, text: string) => void;
     onPhaseEnd?: (phase: StreamPhase) => void;
+    /** Out-of-band notice (e.g. a CAPTCHA appearing or being solved). */
+    onNotice?: (kind: string, message: string, data?: any) => void;
 }
 
 // Seed estimates (tokens) used before enough real samples have been collected.
@@ -212,6 +216,11 @@ export class StreamSession {
     /** Re-emit an event received from another agent (used when relaying streams). */
     forward(event: StreamEvent): void {
         this.emit(event);
+    }
+
+    /** Out-of-band notice (CAPTCHA appeared/solved, etc.). */
+    notice(kind: string, message: string, data?: any): void {
+        this.emit({ type: 'notice', noticeKind: kind, text: message, data, timestamp: Date.now() });
     }
 
     done(data: any): void {

@@ -2,32 +2,47 @@
 import mysql from 'mysql2/promise';
 
 
+const DB_CONFIG = {
+    host: process.env.DB_HOST || 'localhost',
+    port: Number(process.env.DB_PORT) || 3306,
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || 'admin'
+};
+
+const DB_NAME = process.env.DB_NAME || 'interact_gen';
+
 const pool = mysql.createPool({
-    host: 'localhost',
-    user: 'root',
-    password: 'admin',
-    database: 'interact_gen',
+    ...DB_CONFIG,
+    database: DB_NAME,
     waitForConnections: true,
     connectionLimit: 10,
     queueLimit: 0
 });
 
 let schemaChecked = false;
+// While the DB is unreachable, back off so a down database does not turn every
+// query into a fresh connection attempt and a fresh log line.
+let dbUnavailableUntil = 0;
 
 async function ensureSchema() {
     if (schemaChecked) return;
+    if (Date.now() < dbUnavailableUntil) {
+        throw new Error('Database unavailable');
+    }
 
     // We need a separate connection to check/create DB if it doesn't exist
     // But pool is already configured with database 'interact_gen'.
     // Use a temp connection for DB creation check.
-    const tempConnection = await mysql.createConnection({
-        host: 'localhost',
-        user: 'root',
-        password: 'admin'
-    });
+    let tempConnection;
+    try {
+        tempConnection = await mysql.createConnection({ ...DB_CONFIG });
+    } catch (error) {
+        dbUnavailableUntil = Date.now() + 5000;
+        throw error;
+    }
 
     try {
-        await tempConnection.query(`CREATE DATABASE IF NOT EXISTS interact_gen`);
+        await tempConnection.query('CREATE DATABASE IF NOT EXISTS `' + DB_NAME + '`');
 
         // Now ensure tables exist within the pool's DB
         // We can use the pool now that DB exists (or should)
@@ -112,7 +127,8 @@ async function ensureSchema() {
             { name: 'enriched_element_count', def: 'INT DEFAULT 0' },
             { name: 'first_scraped_at', def: 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP' },
             { name: 'scrape_count', def: 'INT DEFAULT 1' },
-            { name: 'notes', def: 'TEXT' }
+            { name: 'notes', def: 'TEXT' },
+            { name: 'page_text', def: 'MEDIUMTEXT' }
         ];
 
         for (const col of columnsToAdd) {

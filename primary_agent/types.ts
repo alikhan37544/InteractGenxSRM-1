@@ -6,6 +6,8 @@ export interface PrimaryAgentConfig {
     model: string;
     temperature: number;
     maxInstructions?: number;
+    /** Max explore→answer→judge rounds for auto-executed requests (default 4). */
+    maxIterations?: number;
 }
 
 export interface IntentRecognitionResult {

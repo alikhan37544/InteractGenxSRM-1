@@ -24,6 +24,8 @@ export interface AgentContext {
     sessionContext?: Record<string, any>;
     /** Pages the agent has visited before (most recent first). */
     recentPages?: RecentPage[];
+    /** Visible text of the current page (normalized, truncated). */
+    pageText?: string;
 }
 
 export interface PageElement {

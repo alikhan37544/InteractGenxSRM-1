@@ -70,12 +70,26 @@ export class ContextManager {
                 availableElements,
                 dbSchema,
                 sessionContext: {},
-                recentPages
+                recentPages,
+                pageText: pageContent.text || ''
             };
 
         } catch (error) {
             console.error('Error getting context:', error);
             throw error;
+        }
+    }
+
+    /**
+     * Lightweight page signature (url/title/leading text) without touching the
+     * database — used for polling (e.g. waiting for a CAPTCHA to be solved).
+     */
+    async getPageSummary(): Promise<{ url: string; title: string; text: string } | null> {
+        await this.ensureInitialized();
+        try {
+            return await browserManager.getPageSummary();
+        } catch {
+            return null;
         }
     }
 
@@ -108,19 +122,28 @@ export class ContextManager {
             });
         }
 
-        // Get element count from DB
+        // Get element count from DB. The database is optional for context
+        // analysis: when it is unavailable the agent must still be able to
+        // navigate and act, so a failed count degrades to 0 instead of
+        // aborting the whole instruction.
         await this.ensureInitialized();
-        const dbElementCount = await query(
-            'SELECT COUNT(*) as count FROM elements WHERE page_url = ?',
-            [context.currentUrl]
-        ) as Array<{ count: number }>;
+        let dbElementCount = 0;
+        try {
+            const rows = await query(
+                'SELECT COUNT(*) as count FROM elements WHERE page_url = ?',
+                [context.currentUrl]
+            ) as Array<{ count: number }>;
+            dbElementCount = rows[0]?.count || 0;
+        } catch (error) {
+            console.warn('Element count unavailable (continuing without DB):', (error as Error)?.message);
+        }
 
         return {
             currentUrl: context.currentUrl,
             currentPageTitle: context.currentPageTitle,
             availableElements: context.availableElements,
             relevantElements,
-            dbElementCount: dbElementCount[0]?.count || 0,
+            dbElementCount,
             hasContext: context.availableElements.length > 0
         };
     }

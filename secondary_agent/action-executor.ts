@@ -2,8 +2,11 @@
 // Executes instructions using browser automation and database
 
 import OpenAI from 'openai';
-import { AgentInstruction, PageElement } from '../shared/types';
+import { AgentInstruction, AgentContext, PageElement } from '../shared/types';
 import { AgentStreamHooks } from '../shared/streaming';
+import { throwIfAborted, isStopError, StopError, abortable } from '../shared/stop';
+import { isVisionModel } from '../shared/vision';
+import { normalizeNavigationTarget } from '../shared/url';
 import { ContextAnalysis, ExecutionResult } from './types';
 import { ContextManager } from './context-manager';
 
@@ -54,7 +57,8 @@ export class ActionExecutor {
     async executeInstruction(
         instruction: AgentInstruction,
         contextAnalysis: ContextAnalysis,
-        hooks?: AgentStreamHooks
+        hooks?: AgentStreamHooks,
+        signal?: AbortSignal
     ): Promise<ExecutionResult> {
         await this.ensureInitialized();
 
@@ -62,39 +66,28 @@ export class ActionExecutor {
         let lastError: Error | null = null;
 
         while (attempts < this.maxRetries) {
+            throwIfAborted(signal);
             try {
                 attempts++;
 
-                switch (instruction.action) {
-                    case 'navigate':
-                        return await this.executeNavigate(instruction, contextAnalysis);
-                    
-                    case 'click':
-                        return await this.executeClick(instruction, contextAnalysis, hooks);
-                    
-                    case 'fill':
-                        return await this.executeFill(instruction, contextAnalysis, hooks);
-                    
-                    case 'extract':
-                        return await this.executeExtract(instruction, contextAnalysis);
-                    
-                    case 'wait':
-                        return await this.executeWait(instruction, contextAnalysis);
-                    
-                    case 'scroll':
-                        return await this.executeScroll(instruction, contextAnalysis);
-                    
-                    default:
-                        throw new Error(`Unknown action: ${instruction.action}`);
-                }
+                // Run the action raced against the stop signal so an in-flight
+                // browser operation or LLM call cannot block a stop.
+                const result = await abortable(
+                    this.runAction(instruction, contextAnalysis, hooks, signal),
+                    signal
+                );
+                return result;
 
             } catch (error) {
+                if (isStopError(error) || signal?.aborted) {
+                    throw error instanceof StopError ? error : new StopError();
+                }
                 lastError = error as Error;
                 console.error(`Execution attempt ${attempts} failed:`, error);
 
                 // If we have retries left and it's a selector issue, try to find better selector
                 if (attempts < this.maxRetries && (instruction.action === 'click' || instruction.action === 'fill')) {
-                    const improvedSelector = await this.improveSelector(instruction, contextAnalysis, hooks);
+                    const improvedSelector = await this.improveSelector(instruction, contextAnalysis, hooks, signal);
                     if (improvedSelector) {
                         instruction.target = improvedSelector;
                     }
@@ -112,40 +105,87 @@ export class ActionExecutor {
     }
 
     /**
+     * Dispatch a single instruction to its handler (raced against the stop
+     * signal by the caller).
+     */
+    private async runAction(
+        instruction: AgentInstruction,
+        contextAnalysis: ContextAnalysis,
+        hooks?: AgentStreamHooks,
+        signal?: AbortSignal
+    ): Promise<ExecutionResult> {
+        switch (instruction.action) {
+            case 'navigate':
+                return await this.executeNavigate(instruction, contextAnalysis, signal);
+            
+            case 'click':
+                return await this.executeClick(instruction, contextAnalysis, hooks, signal);
+            
+            case 'fill':
+                return await this.executeFill(instruction, contextAnalysis, hooks, signal);
+            
+            case 'extract':
+                return await this.executeExtract(instruction, contextAnalysis, signal);
+            
+            case 'wait':
+                return await this.executeWait(instruction, contextAnalysis, signal);
+            
+            case 'scroll':
+                return await this.executeScroll(instruction, contextAnalysis, signal);
+            
+            default:
+                throw new Error(`Unknown action: ${instruction.action}`);
+        }
+    }
+
+    /**
+     * Upsert a visited page and log the visit so the agent can answer
+     * follow-up questions about it later. Never throws: recording a page must
+     * not break the action that reached it.
+     */
+    private async recordVisitedPage(context: AgentContext, action: string): Promise<void> {
+        try {
+            const dbUrl = (context.currentUrl || '').slice(0, 2048);
+            const dbTitle = (context.currentPageTitle || '').slice(0, 512);
+            const dbText = (context.pageText || '').slice(0, 20000);
+            await query(
+                'INSERT INTO scraped_pages (url, title, full_url, page_text) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE title = VALUES(title), full_url = VALUES(full_url), page_text = VALUES(page_text), last_scraped_at = CURRENT_TIMESTAMP',
+                [dbUrl, dbTitle, context.currentUrl, dbText]
+            );
+            await query(
+                'INSERT INTO scraping_history (page_url, action, element_count, notes) VALUES (?, ?, ?, ?)',
+                [dbUrl, action, context.availableElements.length, 'Visited by agent']
+            );
+        } catch (dbError) {
+            console.warn('Failed to record visited page:', dbError);
+        }
+    }
+
+    /**
      * Execute navigate action
      */
     private async executeNavigate(
         instruction: AgentInstruction,
-        contextAnalysis: ContextAnalysis
+        contextAnalysis: ContextAnalysis,
+        signal?: AbortSignal
     ): Promise<ExecutionResult> {
         if (!instruction.target) {
             throw new Error('Navigate action requires a target URL');
         }
 
-        await browserManager.navigate(instruction.target);
+        // Tolerate bare domains ("example.com") and bare words ("google" ->
+        // search) so a sloppy target never crashes with an invalid-URL error.
+        const targetUrl = normalizeNavigationTarget(instruction.target);
+        await browserManager.navigate(targetUrl);
         
         // Wait for page to load
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await abortable(new Promise(resolve => setTimeout(resolve, 2000)), signal);
 
         // Get updated context
         const newContext = await this.contextManager.getCurrentContext();
 
         // Remember the visited page so the agent can reference it later.
-        // Recording must never break navigation, so failures are non-fatal.
-        try {
-            const dbUrl = (newContext.currentUrl || '').slice(0, 2048);
-            const dbTitle = (newContext.currentPageTitle || '').slice(0, 512);
-            await query(
-                'INSERT INTO scraped_pages (url, title, full_url) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE title = VALUES(title), full_url = VALUES(full_url), last_scraped_at = CURRENT_TIMESTAMP',
-                [dbUrl, dbTitle, newContext.currentUrl]
-            );
-            await query(
-                'INSERT INTO scraping_history (page_url, action, element_count, notes) VALUES (?, ?, ?, ?)',
-                [dbUrl, 'navigate', newContext.availableElements.length, 'Visited by agent']
-            );
-        } catch (dbError) {
-            console.warn('Failed to record visited page:', dbError);
-        }
+        await this.recordVisitedPage(newContext, 'navigate');
 
         return {
             success: true,
@@ -162,21 +202,29 @@ export class ActionExecutor {
     private async executeClick(
         instruction: AgentInstruction,
         contextAnalysis: ContextAnalysis,
-        hooks?: AgentStreamHooks
+        hooks?: AgentStreamHooks,
+        signal?: AbortSignal
     ): Promise<ExecutionResult> {
         if (!instruction.target) {
             throw new Error('Click action requires a target selector');
         }
 
-        // Find the best selector
-        const selector = await this.findBestSelector(instruction.target, contextAnalysis, hooks);
+        // Find the best selector (never resolve a click onto a form field —
+        // an input's "text" is its current value, not a clickable label).
+        const selector = await this.findBestSelector(instruction.target, contextAnalysis, hooks, signal, 'click');
         
         await browserManager.clickElement(selector);
         
         // Wait for potential navigation or content update
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        await abortable(new Promise(resolve => setTimeout(resolve, 1500)), signal);
 
-        const newContext = await this.contextManager.getCurrentContext();
+        const newContext = await abortable(this.contextManager.getCurrentContext(), signal);
+
+        // A click that navigated (e.g. a search result link) reached a new page:
+        // persist it so follow-up questions can be answered from memory.
+        if (newContext.currentUrl && newContext.currentUrl !== contextAnalysis.currentUrl) {
+            await this.recordVisitedPage(newContext, 'click');
+        }
 
         return {
             success: true,
@@ -193,20 +241,21 @@ export class ActionExecutor {
     private async executeFill(
         instruction: AgentInstruction,
         contextAnalysis: ContextAnalysis,
-        hooks?: AgentStreamHooks
+        hooks?: AgentStreamHooks,
+        signal?: AbortSignal
     ): Promise<ExecutionResult> {
         if (!instruction.target || !instruction.value) {
             throw new Error('Fill action requires both target selector and value');
         }
 
-        const selector = await this.findBestSelector(instruction.target, contextAnalysis, hooks);
+        const selector = await this.findBestSelector(instruction.target, contextAnalysis, hooks, signal, 'fill');
         
         // fillElement returns the selector actually used: it falls back to the
         // best visible editable field when the provided selector matches
         // nothing (e.g. input[name='q'] on a site that uses a textarea).
         const usedSelector = await browserManager.fillElement(selector, instruction.value);
         
-        const newContext = await this.contextManager.getCurrentContext();
+        const newContext = await abortable(this.contextManager.getCurrentContext(), signal);
 
         return {
             success: true,
@@ -222,7 +271,8 @@ export class ActionExecutor {
      */
     private async executeExtract(
         instruction: AgentInstruction,
-        contextAnalysis: ContextAnalysis
+        contextAnalysis: ContextAnalysis,
+        signal?: AbortSignal
     ): Promise<ExecutionResult> {
         const pageContent = await browserManager.getPageContent();
 
@@ -232,9 +282,10 @@ export class ActionExecutor {
         const dbTitle = (pageContent.title || '').slice(0, 512);
 
         // Save to database
+        const pageText = (pageContent.text || '').slice(0, 20000);
         await query(
-            'INSERT INTO scraped_pages (url, title, full_url) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE title = VALUES(title), full_url = VALUES(full_url), last_scraped_at = CURRENT_TIMESTAMP',
-            [dbUrl, dbTitle, pageContent.url]
+            'INSERT INTO scraped_pages (url, title, full_url, page_text) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE title = VALUES(title), full_url = VALUES(full_url), page_text = VALUES(page_text), last_scraped_at = CURRENT_TIMESTAMP',
+            [dbUrl, dbTitle, pageContent.url, pageText]
         );
 
         await query('DELETE FROM elements WHERE page_url = ?', [dbUrl]);
@@ -270,7 +321,8 @@ export class ActionExecutor {
             result: {
                 url: pageContent.url,
                 title: pageContent.title,
-                elementCount: pageContent.elements.length
+                elementCount: pageContent.elements.length,
+                text: (pageContent.text || '').slice(0, 8000)
             },
             newContext
         };
@@ -281,13 +333,14 @@ export class ActionExecutor {
      */
     private async executeWait(
         instruction: AgentInstruction,
-        contextAnalysis: ContextAnalysis
+        contextAnalysis: ContextAnalysis,
+        signal?: AbortSignal
     ): Promise<ExecutionResult> {
         const timeout = instruction.target 
             ? parseInt(instruction.target) || 2000 
             : 2000;
 
-        await new Promise(resolve => setTimeout(resolve, timeout));
+        await abortable(new Promise(resolve => setTimeout(resolve, timeout)), signal);
 
         return {
             success: true,
@@ -302,7 +355,8 @@ export class ActionExecutor {
      */
     private async executeScroll(
         instruction: AgentInstruction,
-        contextAnalysis: ContextAnalysis
+        contextAnalysis: ContextAnalysis,
+        signal?: AbortSignal
     ): Promise<ExecutionResult> {
         const direction = (instruction.target || 'down') as 'up' | 'down' | 'top' | 'bottom';
         
@@ -322,13 +376,21 @@ export class ActionExecutor {
     private async findBestSelector(
         target: string,
         contextAnalysis: ContextAnalysis,
-        hooks?: AgentStreamHooks
+        hooks?: AgentStreamHooks,
+        signal?: AbortSignal,
+        action: 'click' | 'fill' = 'click'
     ): Promise<string> {
         const targetLower = target.toLowerCase();
+        throwIfAborted(signal);
+
+        // An input's content text is its current value, so it must never be
+        // matched as a click target (e.g. clicking "greece" must not hit the
+        // search box that contains the query).
+        const isClickableKind = (el: PageElement) => action !== 'click' || el.type !== 'INPUT';
 
         // First, try exact match
         const exactMatch = contextAnalysis.availableElements.find(el =>
-            el.selectors.css === target || el.selectors.id === target
+            isClickableKind(el) && (el.selectors.css === target || el.selectors.id === target)
         );
         if (exactMatch) {
             return exactMatch.selectors.css || exactMatch.selectors.id || target;
@@ -349,6 +411,7 @@ export class ActionExecutor {
         // Try to find by text content or semantic attributes (aria-label, class,
         // placeholder, name, tag)
         const textMatch = contextAnalysis.availableElements.find(el => {
+            if (!isClickableKind(el)) return false;
             const haystack = [
                 el.content?.text,
                 el.content?.placeholder,
@@ -369,6 +432,7 @@ export class ActionExecutor {
         // actionable element on the live page (the page may have changed since
         // the context snapshot). Cap the scan to bound the round-trips.
         for (const candidate of contextAnalysis.relevantElements.slice(0, 20)) {
+            if (!isClickableKind(candidate)) continue;
             const selector = candidate.selectors.css || candidate.selectors.id;
             if (selector && await browserManager.countActionableMatches(selector) > 0) {
                 return selector;
@@ -378,12 +442,14 @@ export class ActionExecutor {
         // Use LLM to find better selector if available
         try {
             const improved = await this.improveSelector(
-                { action: 'click', target } as AgentInstruction,
+                { action, target } as AgentInstruction,
                 contextAnalysis,
-                hooks
+                hooks,
+                signal
             );
             if (improved) return improved;
         } catch (error) {
+            if (isStopError(error) || signal?.aborted) throw error;
             console.error('Error improving selector:', error);
         }
 
@@ -397,11 +463,14 @@ export class ActionExecutor {
     private async improveSelector(
         instruction: AgentInstruction,
         contextAnalysis: ContextAnalysis,
-        hooks?: AgentStreamHooks
+        hooks?: AgentStreamHooks,
+        signal?: AbortSignal
     ): Promise<string | null> {
         if (contextAnalysis.availableElements.length === 0) {
             return null;
         }
+
+        throwIfAborted(signal);
 
         try {
             hooks?.onPhaseStart?.('selector_resolution');
@@ -463,15 +532,27 @@ ${JSON.stringify(unique.map(el => ({
 })), null, 2)}
 
 Rules:
+- The action to perform is "${instruction.action}".
 - Prefer a selector from the list above that matches the target description.
 - Prefer visible, enabled elements. Never return a selector that only matches a disabled element.
-- Match the element kind to the action: use an input/textarea for filling, and a button/link for clicking.
+- Match the element kind to the action: use an input/textarea for filling, and a button/link for clicking. Never click an input.
 - The target element may be hidden behind a toggle (e.g. a collapsed search box). If no listed element matches, return a standard CSS selector that matches it (for example "input[type='search']" for a search box).
+- A screenshot of the page is attached; use it to visually confirm the correct element before choosing.
 - Return only the selector, never "none".`;
+
+            // Attach a page screenshot when the loaded model is vision-capable;
+            // it helps resolve elements that the text snapshot describes poorly.
+            let userContent: OpenAI.ChatCompletionContentPart[] = [{ type: 'text', text: prompt }];
+            if (isVisionModel(this.model)) {
+                const screenshot = await abortable<string | null>(browserManager.takeScreenshot(), signal);
+                if (screenshot) {
+                    userContent.push({ type: 'image_url', image_url: { url: screenshot } });
+                }
+            }
 
             const messages: OpenAI.ChatCompletionMessageParam[] = [
                 { role: 'system', content: 'You are a CSS selector expert. Pick a selector that matches the target. Respond with JSON only.' },
-                { role: 'user', content: prompt }
+                { role: 'user', content: userContent }
             ];
 
             const responseFormat = {
@@ -497,9 +578,10 @@ Rules:
                     max_tokens: 2048,
                     response_format: responseFormat,
                     stream: true
-                });
+                }, { signal });
                 content = '';
                 for await (const chunk of stream) {
+                    throwIfAborted(signal);
                     const delta = chunk.choices[0]?.delta?.content || '';
                     const reasoning = (chunk.choices[0]?.delta as any)?.reasoning_content || '';
                     if (reasoning) {
@@ -517,7 +599,7 @@ Rules:
                     temperature: this.temperature,
                     max_tokens: 2048,
                     response_format: responseFormat
-                });
+                }, { signal });
                 content = completion.choices[0].message.content;
             }
 
@@ -548,7 +630,7 @@ Rules:
                 }
 
                 // Verify the selector actually matches something on the page.
-                const matches = await browserManager.countMatches(cleaned);
+                const matches = await abortable(browserManager.countMatches(cleaned), signal);
                 if (matches === 0) {
                     console.warn(`Selector resolution returned a selector with no matches: "${cleaned}"`);
                     return null;
@@ -558,6 +640,9 @@ Rules:
             }
 
         } catch (error) {
+            if (isStopError(error) || signal?.aborted) {
+                throw error instanceof StopError ? error : new StopError();
+            }
             console.error('Error improving selector with LLM:', error);
         }
 
